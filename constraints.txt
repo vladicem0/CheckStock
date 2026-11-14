@@ -1,6 +1,7 @@
 # Runtime and test dependency versions from the verified Python 3.12 Linux image.
 # Install the pyproject.toml requirements with --constraint constraints.txt.
 # pip is base-image tooling and is intentionally not part of this dependency set.
+Jinja2==3.1.6
 Mako==1.4.3
 MarkupSafe==3.0.4
 Pygments==2.21.0

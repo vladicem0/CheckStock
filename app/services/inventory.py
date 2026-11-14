@@ -39,6 +39,16 @@ def operation_view(session: Session, operation: Operation) -> dict[str, Any]:
         session.get(Warehouse, operation.destination_warehouse_id, populate_existing=True)
         if operation.destination_warehouse_id else None
     )
+    return _operation_view(operation, product, source, destination)
+
+
+def _operation_view(
+    operation: Operation,
+    product: Product,
+    source: Warehouse | None,
+    destination: Warehouse | None,
+) -> dict[str, Any]:
+    """Project already loaded references without further database access."""
     return dict(id=operation.id, kind=operation.kind, status=operation.status,
                 product_id=product.id, sku=product.sku, product_name=product.name, qty=operation.qty,
                 source_warehouse_id=operation.source_warehouse_id,
@@ -51,9 +61,20 @@ def operation_view(session: Session, operation: Operation) -> dict[str, Any]:
 
 def list_operations(session: Session) -> list[dict[str, Any]]:
     _require_report_snapshot(session)
-    return [operation_view(session, operation) for operation in session.scalars(
+    operations = session.scalars(
         select(Operation).order_by(Operation.created_at.desc(), Operation.id)
-        .execution_options(populate_existing=True))]
+        .execution_options(populate_existing=True)
+    ).all()
+    # Keep refreshed references alive for this report, including reused sessions.
+    products = {product.id: product for product in session.scalars(
+        select(Product).execution_options(populate_existing=True))}
+    warehouses = {warehouse.id: warehouse for warehouse in session.scalars(
+        select(Warehouse).execution_options(populate_existing=True))}
+    return [_operation_view(
+        operation, products[operation.product_id],
+        warehouses.get(operation.source_warehouse_id),
+        warehouses.get(operation.destination_warehouse_id),
+    ) for operation in operations]
 
 
 def list_history(session: Session) -> list[dict[str, Any]]:
@@ -75,6 +96,8 @@ def get_inventory(session: Session) -> dict[str, Any]:
         select(Warehouse).order_by(Warehouse.created_at, Warehouse.id)
         .execution_options(populate_existing=True)
     ).all()
+    products_by_id = {product.id: product for product in products}
+    warehouses_by_id = {warehouse.id: warehouse for warehouse in warehouses}
     balances = {(b.product_id, b.warehouse_id): b for b in session.scalars(
         select(StockBalance).execution_options(populate_existing=True))}
     cells = []
@@ -91,7 +114,11 @@ def get_inventory(session: Session) -> dict[str, Any]:
                                     .order_by(Operation.created_at, Operation.id)
                                     .execution_options(populate_existing=True)):
         category = "ff" if operation.kind == "transfer" else operation.kind
-        transit[category].append(operation_view(session, operation))
+        transit[category].append(_operation_view(
+            operation, products_by_id[operation.product_id],
+            warehouses_by_id.get(operation.source_warehouse_id),
+            warehouses_by_id.get(operation.destination_warehouse_id),
+        ))
     totals = {field: sum(cell[field] for cell in cells) for field in ("on_hand", "reserved_fbs", "available")}
     totals.update({f"transit_{key}": sum(op["qty"] for op in rows) for key, rows in transit.items()})
     return dict(products=[dict(id=p.id, sku=p.sku, name=p.name) for p in products],

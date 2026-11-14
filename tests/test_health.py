@@ -25,7 +25,7 @@ def test_health_uses_postgresql_without_creating_demo_data(empty_db, stock_snaps
     assert stock_snapshot() == before
 
 
-def test_health_reports_unavailable_database_without_internal_diagnostic(empty_db, monkeypatch):
+def test_health_reports_unavailable_database_without_internal_diagnostic(empty_db, monkeypatch, caplog):
     def failing_execute(*args, **kwargs):
         raise OperationalError("SELECT 1", None, RuntimeError("internal-diagnostic-marker"))
 
@@ -41,5 +41,8 @@ def test_health_reports_unavailable_database_without_internal_diagnostic(empty_d
         assert response.status_code == 503
         assert response.json() == {"detail": "База данных недоступна"}
         assert "internal-diagnostic-marker" not in response.text
+        assert "type=OperationalError status=503" in caplog.text
+        assert "failing_execute" in caplog.text
+        assert "internal-diagnostic-marker" not in caplog.text
     finally:
         app.dependency_overrides.pop(get_session, None)

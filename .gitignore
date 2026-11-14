@@ -12,3 +12,6 @@ dist/
 .coverage
 htmlcov/
 *.log
+tests/browser/node_modules/
+tests/browser/test-results/
+tests/browser/playwright-report/

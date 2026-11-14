@@ -1,0 +1,9 @@
+{
+  "name": "checkstock-browser-tests",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Optional browser checks of the actual panel with intercepted API fixtures",
+  "scripts": {"test": "playwright test"},
+  "devDependencies": {"@playwright/test": "1.55.0"},
+  "engines": {"node": ">=18"}
+}

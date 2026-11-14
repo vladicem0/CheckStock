@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="CheckStock — остатки на ФФ, резерв FBS и товар в пути.">
+  <title>CheckStock · Где сейчас товар?</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+  <script src="{{ url_for('static', path='app.js') }}" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">К содержимому</a>
+  <header class="site-header">
+    <div class="header-inner">
+      <a href="#overview" class="brand" aria-label="CheckStock — остатки"><span class="brand-mark" aria-hidden="true">C<span>•</span></span>CheckStock</a>
+      <nav aria-label="Разделы панели">
+        <a href="#overview">Остатки</a><a href="#transit">В пути</a><a href="#operations">Операции</a><a href="#warehouses">Склады</a><a href="#history">История</a>
+      </nav>
+      <span class="local-label"><span aria-hidden="true"></span>Локальный прототип</span>
+    </div>
+  </header>
+  <main id="main" class="page">{% block content %}{% endblock %}</main>
+  <footer class="page-footer"><span>CheckStock · Один магазин, единый учёт</span><a href="/docs">Документация API ↗</a></footer>
+</body>
+</html>

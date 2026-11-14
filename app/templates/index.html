@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block content %}
+<section id="overview" class="section overview">
+  <div class="page-heading">
+    <div><p class="eyebrow">СКЛАДСКОЙ УЧЁТ</p><h1>Где сейчас товар?</h1><p class="subtitle">Остатки на ФФ, резервы и отправки — в одной панели.</p></div>
+    <div class="refresh-area"><button type="button" id="refresh-button" class="button secondary">Обновить данные</button><span id="updated-at" class="muted" role="status">Загружаем данные…</span></div>
+  </div>
+  <div id="global-error" class="feedback error" role="alert" hidden></div>
+  <noscript><p class="feedback error">Для работы панели включите JavaScript. Документация API доступна по ссылке внизу.</p></noscript>
+  <div id="seed-empty" class="empty-setup" hidden><strong>Товары ещё не загружены</strong><p>После подготовки начальных данных здесь появятся товары и остатки. Склады можно создать в разделе ниже.</p></div>
+  <div class="kpi-grid" aria-label="Сводка товара">
+    <article class="kpi"><span>Физически на ФФ</span><strong id="total-on-hand">—</strong><small>шт. на всех складах</small></article>
+    <article class="kpi"><span>В резерве FBS</span><strong id="total-reserved">—</strong><small>входит в физический запас</small></article>
+    <article class="kpi accent"><span>Доступно на ФФ</span><strong id="total-available">—</strong><small>физически − резерв</small></article>
+    <article class="kpi"><span>Между ФФ</span><strong id="total-transit-ff">—</strong><small>шт. в пути</small></article>
+    <article class="kpi"><span>FBO маркетплейсу</span><strong id="total-transit-fbo">—</strong><small>шт. в пути</small></article>
+    <article class="kpi"><span>FBS клиенту</span><strong id="total-transit-fbs">—</strong><small>шт. в пути</small></article>
+  </div>
+  <div class="panel">
+    <div class="panel-heading"><div><h2>Остатки на ФФ</h2><p>Все SKU и склады, включая нулевые остатки.</p></div><span class="unit-tag">Единица учёта · шт.</span></div>
+    <div class="table-scroll" tabindex="0" aria-label="Матрица остатков с горизонтальной прокруткой"><table id="stock-table"><caption class="sr-only">Физический остаток, резерв FBS и доступное количество по каждому SKU и складу</caption><thead></thead><tbody><tr><td class="empty">Загружаем остатки…</td></tr></tbody></table></div>
+    <p class="panel-note">Резерв уже входит в физический запас. Доступность считается отдельно для каждого ФФ.</p>
+    <p id="archive-note" class="archive-note" hidden>Архивные ФФ остаются в учёте. Их «доступно» — арифметический остаток: новые приходы, резервы, FBO и входящие перемещения запрещены. Остатки можно вывести перемещением на активный ФФ.</p>
+  </div>
+</section>
+
+<section id="transit" class="section">
+  <div class="section-heading"><div><p class="eyebrow">ПОСЛЕ ОТПРАВКИ</p><h2>Товар в пути</h2></div><p>Отправленный товар уже исключён из остатков ФФ.</p></div>
+  <div class="transit-grid">
+    <article class="panel transit-card"><div class="transit-heading"><span class="route-icon" aria-hidden="true">↔</span><h3>Между ФФ</h3><span id="transit-ff-count" class="count">0 шт.</span></div><div id="transit-ff-list"></div></article>
+    <article class="panel transit-card"><div class="transit-heading"><span class="route-icon" aria-hidden="true">↗</span><h3>FBO маркетплейсу</h3><span id="transit-fbo-count" class="count">0 шт.</span></div><div id="transit-fbo-list"></div></article>
+    <article class="panel transit-card"><div class="transit-heading"><span class="route-icon" aria-hidden="true">→</span><h3>FBS клиенту</h3><span id="transit-fbs-count" class="count">0 шт.</span></div><div id="transit-fbs-list"></div></article>
+  </div>
+  <p class="section-note">FBS остаётся в пути после отправки: подтверждение доставки не входит в этот прототип. Принятый FBO отражён в истории и не возвращается на ФФ.</p>
+</section>
+
+<section id="operations" class="section">
+  <div class="section-heading"><div><p class="eyebrow">ДВИЖЕНИЕ ТОВАРА</p><h2>Операции</h2></div><p>Одна операция — один SKU и полное количество.</p></div>
+  <div class="forms-grid">
+    <form id="receipt-form" class="panel operation-form" action="/api/receipts" method="post" data-operation-form>
+      <div class="form-heading"><span class="form-number">01</span><h3>Приход</h3></div><p class="form-description">Добавить товар на выбранный ФФ.</p>
+      <label for="receipt-product">Товар</label><select id="receipt-product" name="product_id" required data-products></select>
+      <label for="receipt-warehouse">Склад приёмки</label><select id="receipt-warehouse" name="warehouse_id" required data-warehouses="active"></select>
+      <label for="receipt-qty">Количество, шт.</label><input id="receipt-qty" name="qty" type="number" min="1" max="2147483647" step="1" value="1" required>
+      <button class="button primary" type="submit" disabled>Оформить приход</button><p class="feedback error form-error" role="alert" hidden></p><p class="feedback success form-status" role="status" hidden></p>
+    </form>
+    <form id="transfer-form" class="panel operation-form" action="/api/transfers" method="post" data-operation-form>
+      <div class="form-heading"><span class="form-number">02</span><h3>Перемещение</h3></div><p class="form-description">Создать заявку; отправка — отдельным шагом.</p>
+      <label for="transfer-product">Товар</label><select id="transfer-product" name="product_id" required data-products></select>
+      <div class="field-pair"><div><label for="transfer-source">Откуда</label><select id="transfer-source" name="source_warehouse_id" required data-warehouses="all"></select></div><div><label for="transfer-destination">Куда</label><select id="transfer-destination" name="destination_warehouse_id" required data-warehouses="active"></select></div></div>
+      <label for="transfer-qty">Количество, шт.</label><input id="transfer-qty" name="qty" type="number" min="1" max="2147483647" step="1" value="1" required>
+      <button class="button primary" type="submit" disabled>Создать перемещение</button><p class="feedback error form-error" role="alert" hidden></p><p class="feedback success form-status" role="status" hidden></p>
+    </form>
+    <form id="fbs-form" class="panel operation-form" action="/api/fbs/reservations" method="post" data-operation-form>
+      <div class="form-heading"><span class="form-number">03</span><h3>Резерв FBS</h3></div><p class="form-description">Блокирует доступность до отправки или отмены.</p>
+      <label for="fbs-product">Товар</label><select id="fbs-product" name="product_id" required data-products></select>
+      <label for="fbs-warehouse">Склад отгрузки</label><select id="fbs-warehouse" name="warehouse_id" required data-warehouses="active"></select>
+      <div class="field-pair"><div><label for="fbs-qty">Количество, шт.</label><input id="fbs-qty" name="qty" type="number" min="1" max="2147483647" step="1" value="1" required></div><div><label for="fbs-customer">Клиент</label><input id="fbs-customer" name="customer" type="text" maxlength="200" placeholder="Например, заказ 101" required></div></div>
+      <button class="button primary" type="submit" disabled>Зарезервировать</button><p class="feedback error form-error" role="alert" hidden></p><p class="feedback success form-status" role="status" hidden></p>
+    </form>
+    <form id="fbo-form" class="panel operation-form" action="/api/fbo/shipments" method="post" data-operation-form>
+      <div class="form-heading"><span class="form-number">04</span><h3>Отправка FBO</h3></div><p class="form-description">Сразу списывает товар и переводит его в путь.</p>
+      <label for="fbo-product">Товар</label><select id="fbo-product" name="product_id" required data-products></select>
+      <label for="fbo-warehouse">Склад отгрузки</label><select id="fbo-warehouse" name="warehouse_id" required data-warehouses="active"></select>
+      <div class="field-pair"><div><label for="fbo-qty">Количество, шт.</label><input id="fbo-qty" name="qty" type="number" min="1" max="2147483647" step="1" value="1" required></div><div><label for="fbo-marketplace">Маркетплейс</label><input id="fbo-marketplace" name="marketplace" type="text" maxlength="200" placeholder="Название" required></div></div>
+      <button class="button primary" type="submit" disabled>Отправить FBO</button><p class="feedback error form-error" role="alert" hidden></p><p class="feedback success form-status" role="status" hidden></p>
+    </form>
+  </div>
+  <div class="panel operation-list"><div class="panel-heading"><div><h3>Журнал операций</h3><p>Отправляйте и принимайте товар по статусу операции.</p></div><span id="operation-count" class="unit-tag"></span></div>
+    <div id="operations-error" class="feedback error" role="alert" hidden></div><div id="operations-status" class="feedback success" role="status" hidden></div>
+    <div class="table-scroll" tabindex="0" aria-label="Таблица операций с горизонтальной прокруткой"><table><thead><tr><th>Операция</th><th>Товар</th><th>Кол-во</th><th>Маршрут</th><th>Статус</th><th>Действие</th></tr></thead><tbody id="operations-body"><tr><td colspan="6" class="empty">Загружаем операции…</td></tr></tbody></table></div>
+  </div>
+</section>
+
+<section id="warehouses" class="section">
+  <div class="section-heading"><div><p class="eyebrow">ПОСТОЯННЫЕ МЕСТА ХРАНЕНИЯ</p><h2>Склады ФФ</h2></div><p>Архивация сохраняет товар, операции и историю.</p></div>
+  <div class="panel warehouse-panel">
+    <form id="warehouse-form" class="warehouse-create" action="/api/warehouses" method="post"><div><label for="warehouse-name">Название нового ФФ</label><input id="warehouse-name" name="name" type="text" maxlength="200" placeholder="Например, Восток" required></div><button type="submit" class="button primary">Создать склад</button><p class="feedback error form-error" role="alert" hidden></p><p class="feedback success form-status" role="status" hidden></p></form>
+    <div id="warehouses-error" class="feedback error" role="alert" hidden></div><div id="warehouses-status" class="feedback success" role="status" hidden></div>
+    <div id="warehouse-list" class="warehouse-list"></div>
+  </div>
+</section>
+
+<section id="history" class="section">
+  <div class="section-heading"><div><p class="eyebrow">СОХРАНЁННЫЕ СОБЫТИЯ</p><h2>История движения</h2></div><p id="history-timezone">Время устройства; точное UTC-время — в подсказке.</p></div>
+  <div class="panel"><div class="table-scroll" tabindex="0" aria-label="История с горизонтальной прокруткой"><table><thead><tr><th>Время</th><th>Действие</th><th>SKU</th><th>Кол-во</th><th>Откуда → куда</th><th>Статус / ID</th></tr></thead><tbody id="history-body"><tr><td colspan="6" class="empty">Загружаем историю…</td></tr></tbody></table></div><p class="panel-note">Названия складов сохраняются на момент события. Ошибочные и повторные подтверждения не добавляют движений.</p></div>
+</section>
+{% endblock %}
