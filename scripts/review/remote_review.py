@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from protocol import make_blocked, parse_claude_output, validate_result
+from protocol import make_blocked, parse_claude_output, strict_json_loads, validate_result
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 STAGE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
@@ -188,9 +188,17 @@ def run_claude(config, snapshot, run_dir, base, head, stage):
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=5)
             raise ReviewError("Claude review timed out") from exc
-    if returncode:
-        raise ReviewError(f"Claude exited with code {returncode}; see claude.stderr.log")
     raw = (run_dir / "claude.stdout.json").read_text(encoding="utf-8")
+    if returncode:
+        message = f"Claude exited with code {returncode}; see claude.stderr.log"
+        try:
+            failure = strict_json_loads(raw)
+            if (isinstance(failure, dict) and failure.get("is_error") is True
+                    and isinstance(failure.get("result"), str) and failure["result"].strip()):
+                message += ": " + failure["result"].strip()[:1500]
+        except ValueError:
+            pass
+        raise ReviewError(message)
     result = parse_claude_output(raw, base, head)
     return result, {"claude_seconds": round(time.monotonic() - started, 3),
                     "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest()}

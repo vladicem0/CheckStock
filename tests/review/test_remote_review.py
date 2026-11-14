@@ -338,6 +338,46 @@ class RemoteReviewTests(unittest.TestCase):
         self.assertEqual(launch.call_args.kwargs["cwd"], snapshot)
         self.assertEqual(launch.call_args.kwargs["stdin"], subprocess.DEVNULL)
 
+    def failed_cli_error(self, stdout):
+        snapshot = self.root / "failed-model-snapshot"
+        snapshot.mkdir()
+        run_dir = self.root / "failed-model-run"
+        run_dir.mkdir()
+        help_flags = (
+            "--safe-mode --restricted --json-schema --tools --strict-mcp-config "
+            "--permission-prompts --system-prompt --no-session-persistence"
+        )
+
+        def start_process(command, **kwargs):
+            kwargs["stdout"].write(stdout.encode("utf-8"))
+            kwargs["stdout"].flush()
+            process = mock.Mock()
+            process.wait.return_value = 1
+            return process
+
+        with mock.patch.object(runner.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, stdout=help_flags, stderr="")), mock.patch.object(
+                    runner.subprocess, "Popen", side_effect=start_process), mock.patch.object(
+                        runner, "parse_claude_output") as parse_verdict:
+            with self.assertRaises(runner.ReviewError) as failure:
+                runner.run_claude(self.config, snapshot, run_dir, self.base, self.head, "inventory")
+        parse_verdict.assert_not_called()
+        return str(failure.exception)
+
+    def test_failed_model_reports_actionable_api_error_without_treating_it_as_verdict(self):
+        message = "Updated terms require acceptance."
+        failure = self.failed_cli_error(json.dumps({
+            "is_error": True, "api_error_status": 400, "result": message,
+        }))
+        self.assertIn(message, failure)
+        self.assertIn("1", failure)
+
+    def test_failed_model_with_nonjson_output_preserves_generic_exit_diagnostic(self):
+        failure = self.failed_cli_error("<html>Upstream proxy failed</html>")
+        self.assertIn("Claude exited with code 1", failure)
+        self.assertIn("claude.stderr.log", failure)
+        self.assertNotIn("<html>", failure)
+
 
 if __name__ == "__main__":
     unittest.main()
