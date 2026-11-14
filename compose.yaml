@@ -9,7 +9,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U checkstock -d checkstock"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U checkstock -d checkstock"]
       interval: 2s
       timeout: 5s
       retries: 20
