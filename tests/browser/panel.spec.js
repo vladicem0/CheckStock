@@ -148,6 +148,70 @@ for (const failure of ['lost-response', 'http-503', 'malformed-success']) {
   });
 }
 
+test('UUID fallback preserves an uncertain request across reload and gives new operations fresh keys', async ({page, dashboard}) => {
+  await page.addInitScript(() => {
+    const randomBytes = crypto.getRandomValues.bind(crypto);
+    Object.defineProperty(crypto, 'randomUUID', {configurable: true, value: undefined});
+    Object.defineProperty(crypto, 'getRandomValues', {configurable: true, value: bytes => {
+      window.randomByteRequests = (window.randomByteRequests || 0) + 1;
+      return randomBytes(bytes);
+    }});
+  });
+  const submissions = [];
+  dashboard.handle = async ({route, method, path, body}) => {
+    if (method !== 'POST' || path !== '/api/fbs/reservations') return false;
+    submissions.push(body);
+    if (submissions.length === 1) await route.abort('failed');
+    else await route.fulfill({json: operation({qty: body.qty, idempotency_key: body.idempotency_key})});
+    return true;
+  };
+  await openPanel(page);
+  await fillFbs(page, {qty: 3, customer: 'Сохранённый заказ'});
+  await page.locator('#fbs-form button[type="submit"]').click();
+  await expect(page.locator('#fbs-form .form-error')).toBeVisible();
+  expect(submissions).toHaveLength(1);
+  expect(submissions[0].idempotency_key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  expect(await page.evaluate(() => window.randomByteRequests)).toBe(1);
+  await page.reload();
+  await expect(page.locator('#updated-at')).toContainText('Обновлено');
+  await expect(page.locator('#fbs-qty')).toHaveValue('3');
+  await expect(page.locator('#fbs-customer')).toHaveValue('Сохранённый заказ');
+  await expect(page.locator('#fbs-qty')).toBeDisabled();
+  await page.locator('#fbs-form button[type="submit"]').click();
+  await expect(page.locator('#fbs-form .form-status')).toContainText('SKU-101');
+  expect(submissions).toHaveLength(2);
+  expect(submissions[1]).toEqual(submissions[0]);
+  expect(await page.evaluate(() => window.randomByteRequests || 0)).toBe(0);
+
+  await fillFbs(page, {qty: 1, customer: 'Новый заказ'});
+  await page.locator('#fbs-form button[type="submit"]').click();
+  await expect(page.locator('#fbs-qty')).toHaveValue('');
+  expect(submissions).toHaveLength(3);
+  expect(submissions[2].idempotency_key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  expect(submissions[2].idempotency_key).not.toBe(submissions[0].idempotency_key);
+  expect(await page.evaluate(() => window.randomByteRequests)).toBe(1);
+});
+
+test('unavailable secure randomness reports an inline error without sending or locking the form', async ({page, dashboard}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(crypto, 'randomUUID', {configurable: true, value: undefined});
+    Object.defineProperty(crypto, 'getRandomValues', {configurable: true, value: () => {
+      throw new Error('Synthetic secure randomness failure');
+    }});
+  });
+  await openPanel(page);
+  await fillFbs(page);
+  await page.locator('#fbs-form button[type="submit"]').click();
+  await expect(page.locator('#fbs-form .form-error')).toHaveText('Не удалось создать ключ операции. Обновите страницу и повторите попытку.');
+  expect(dashboard.requests.filter(request => request.method !== 'GET')).toHaveLength(0);
+  for (const selector of ['#fbs-product', '#fbs-warehouse', '#fbs-qty', '#fbs-customer', '#fbs-form button[type="submit"]']) {
+    await expect(page.locator(selector)).toBeEnabled();
+  }
+  await expect(page.locator('#fbs-qty')).toHaveValue('4');
+  await page.locator('#fbs-qty').fill('2');
+  await expect(page.locator('#fbs-qty')).toHaveValue('2');
+});
+
 test('successful mutation followed by failed refresh is not submitted twice', async ({page, dashboard}) => {
   let committed = false;
   let failReports = true;
@@ -251,6 +315,8 @@ test('refresh preserves an unsaved warehouse rename and history keeps its snapsh
   await expect(input).toHaveValue('Новый Север');
   await input.locator('..').getByRole('button', {name: 'Сохранить имя'}).click();
   await expect(page.locator('#stock-table thead')).toContainText('Новый Север');
+  await expect(page.locator('#warehouses-status')).toContainText('Название склада сохранено');
+  await expect(page.locator('#warehouses-error')).toBeHidden();
   await expect(page.locator('#history-body')).toContainText('Север');
   await expect(page.locator('#history-body')).not.toContainText('Новый Север');
 });
@@ -269,6 +335,8 @@ test('archive retains stock and history without silently choosing a new source',
   await page.getByRole('button', {name: 'Архивировать ФФ «Юг»', exact: true}).click();
   await page.getByRole('group', {name: 'Подтверждение архивации ФФ «Юг»'}).getByRole('button', {name: 'Подтвердить архивацию'}).click();
   await expect(page.locator('#archive-note')).toBeVisible();
+  await expect(page.locator('#warehouses-status')).toContainText('Склад архивирован');
+  await expect(page.locator('#warehouses-error')).toBeHidden();
   await expect(page.locator('#fbs-warehouse')).toHaveValue('');
   await expect(page.locator('#fbs-form button[type="submit"]')).toBeDisabled();
   await expect(page.locator('#total-on-hand')).toHaveText('25');
@@ -277,6 +345,187 @@ test('archive retains stock and history without silently choosing a new source',
   await expect(page.locator(`#transfer-source option[value="${SOUTH}"]`)).toHaveCount(1);
   await expect(page.locator(`#transfer-destination option[value="${SOUTH}"]`)).toHaveCount(0);
 });
+
+const warehouseWarning = 'Результат изменения склада не подтверждён. Нажмите «Обновить данные» и проверьте список складов, прежде чем повторять действие.';
+
+function appendEmptyWarehouse(inventory, warehouse) {
+  inventory.warehouses.push(warehouse);
+  for (const product of inventory.products) {
+    inventory.balances.push({
+      product_id: product.id, warehouse_id: warehouse.id, sku: product.sku,
+      warehouse_name: warehouse.name, archived: false,
+      on_hand: 0, reserved_fbs: 0, available: 0,
+    });
+  }
+}
+
+const malformedWarehouseCases = [
+  ...['create', 'rename', 'archive'].flatMap(action => [
+    {action, label: 'null', response: null},
+    {action, label: 'empty object', response: {}},
+  ]),
+  {action: 'create', label: 'numeric id', response: {id: 7, name: 'Восток', archived: false}},
+  {action: 'rename', label: 'blank name', response: {id: NORTH, name: ' \t ', archived: false}},
+  {action: 'archive', label: 'nonboolean archived', response: {id: NORTH, name: 'Север', archived: 'true'}},
+  {action: 'create', label: 'array', response: []},
+];
+
+for (const {action, label, response} of malformedWarehouseCases) {
+  test(`warehouse ${action} rejects 200 ${label} without losing input or claiming success`, async ({page, dashboard}) => {
+    const method = {create: 'POST', rename: 'PATCH', archive: 'DELETE'}[action];
+    const path = action === 'create' ? '/api/warehouses' : `/api/warehouses/${NORTH}`;
+    const createdId = '00000000-0000-4000-8000-000000000203';
+    const enteredName = action === 'create' ? '  Восток  ' : '  Новый Север  ';
+    dashboard.handle = async ({route, method: requestMethod, path: requestPath, body}) => {
+      if (requestMethod !== method || requestPath !== path) return false;
+      // A malformed success body cannot tell the client whether the command
+      // committed. Only the later explicit refresh reveals this fixture state.
+      if (action === 'create') {
+        appendEmptyWarehouse(dashboard.data.inventory, {
+          id: createdId, name: body.name, archived: false, archived_at: null, created_at: DATE,
+        });
+      } else if (action === 'rename') {
+        dashboard.data.inventory.warehouses[0].name = body.name;
+      } else {
+        dashboard.data.inventory.warehouses[0].archived = true;
+        dashboard.data.inventory.warehouses[0].archived_at = DATE;
+      }
+      await route.fulfill({status: 200, json: response});
+      return true;
+    };
+    await openPanel(page);
+    const initialReads = dashboard.requests.filter(request => request.method === 'GET').length;
+    const renameInput = page.locator(`#warehouse-rename-${NORTH}`);
+    const archiveGroup = page.getByRole('group', {name: 'Подтверждение архивации ФФ «Север»'});
+    if (action === 'create') {
+      await page.locator('#warehouse-name').fill(enteredName);
+      await page.locator('#warehouse-form button[type="submit"]').click();
+    } else if (action === 'rename') {
+      await renameInput.fill(enteredName);
+      await renameInput.locator('..').getByRole('button', {name: 'Сохранить имя'}).click();
+    } else {
+      await page.getByRole('button', {name: 'Архивировать ФФ «Север»', exact: true}).click();
+      await archiveGroup.getByRole('button', {name: 'Подтвердить архивацию'}).click();
+    }
+    const error = page.locator(action === 'create' ? '#warehouse-form .form-error' : '#warehouses-error');
+    const success = page.locator(action === 'create' ? '#warehouse-form .form-status' : '#warehouses-status');
+    await expect(error).toHaveText(`Сервер вернул некорректные данные склада. ${warehouseWarning}`);
+    await expect(success).toBeHidden();
+    if (action === 'create') {
+      await expect(page.locator('#warehouse-name')).toHaveValue(enteredName);
+      await expect(page.locator('#warehouse-name')).toBeEnabled();
+      await expect(page.locator('#warehouse-form button[type="submit"]')).toBeEnabled();
+    } else if (action === 'rename') {
+      await expect(renameInput).toHaveValue(enteredName);
+      await expect(renameInput).toBeEnabled();
+      await expect(renameInput.locator('..').getByRole('button', {name: 'Сохранить имя'})).toBeEnabled();
+    } else {
+      await expect(archiveGroup).toBeVisible();
+      await expect(archiveGroup.getByRole('button', {name: 'Подтвердить архивацию'})).toBeEnabled();
+      await expect(archiveGroup.getByRole('button', {name: 'Отмена', exact: true})).toBeEnabled();
+    }
+    expect(dashboard.requests.filter(request => request.method === 'GET')).toHaveLength(initialReads);
+    expect(dashboard.requests.filter(request => request.method !== 'GET')).toHaveLength(1);
+
+    await page.locator('#refresh-button').click();
+    await expect(page.locator('#refresh-button')).toBeEnabled();
+    if (action === 'create') {
+      await expect(page.locator(`[data-warehouse-id="${createdId}"] h3`)).toHaveText('Восток');
+      await expect(page.locator('#warehouse-name')).toHaveValue(enteredName);
+    } else if (action === 'rename') {
+      await expect(page.locator(`[data-warehouse-id="${NORTH}"] h3`)).toHaveText('Новый Север');
+      // Keeping the original spaces proves the unsaved draft survived rerender,
+      // rather than being replaced by the trimmed name from the fresh report.
+      await expect(renameInput).toHaveValue(enteredName);
+    } else {
+      await expect(page.locator(`[data-warehouse-id="${NORTH}"] .badge.archive`)).toHaveText('Архив');
+    }
+    await expect(success).toBeHidden();
+    expect(dashboard.requests.filter(request => request.method !== 'GET')).toHaveLength(1);
+  });
+}
+
+test('valid warehouse create confirms success, clears its input and refreshes the list', async ({page, dashboard}) => {
+  const createdId = '00000000-0000-4000-8000-000000000203';
+  dashboard.handle = async ({route, method, path, body}) => {
+    if (method !== 'POST' || path !== '/api/warehouses') return false;
+    const warehouse = {id: createdId, name: body.name, archived: false, archived_at: null, created_at: DATE};
+    appendEmptyWarehouse(dashboard.data.inventory, warehouse);
+    await route.fulfill({status: 200, json: warehouse});
+    return true;
+  };
+  await openPanel(page);
+  await page.locator('#warehouse-name').fill('  Восток  ');
+  await page.locator('#warehouse-form button[type="submit"]').click();
+  await expect(page.locator('#warehouse-form .form-status')).toHaveText('ФФ «Восток» создан.');
+  await expect(page.locator('#warehouse-form .form-error')).toBeHidden();
+  await expect(page.locator('#warehouse-name')).toHaveValue('');
+  await expect(page.locator('#warehouse-form button[type="submit"]')).toBeEnabled();
+  await expect(page.locator(`[data-warehouse-id="${createdId}"] h3`)).toHaveText('Восток');
+  await expect(page.locator('#stock-table .matrix-values')).toHaveCount(9);
+  expect(dashboard.requests.filter(request => request.method !== 'GET')).toEqual([
+    {method: 'POST', path: '/api/warehouses', body: {name: 'Восток'}},
+  ]);
+});
+
+for (const action of ['create', 'rename', 'archive']) {
+  for (const uncertain of [true, false]) {
+    test(`warehouse ${action} ${uncertain ? 'uncertain result advises verification' : 'definite rejection keeps only the domain error'}`, async ({page, dashboard}) => {
+      const method = {create: 'POST', rename: 'PATCH', archive: 'DELETE'}[action];
+      const path = action === 'create' ? '/api/warehouses' : `/api/warehouses/${NORTH}`;
+      const createdId = '00000000-0000-4000-8000-000000000203';
+      dashboard.handle = async ({route, method: requestMethod, path: requestPath, body}) => {
+        if (requestMethod !== method || requestPath !== path) return false;
+        if (uncertain) {
+          // The command may have committed before its response was lost.
+          if (action === 'create') {
+            dashboard.data.inventory.warehouses.push({id: createdId, name: body.name, archived: false, archived_at: null, created_at: DATE});
+            for (const product of dashboard.data.inventory.products) {
+              dashboard.data.inventory.balances.push({
+                product_id: product.id, warehouse_id: createdId, sku: product.sku,
+                warehouse_name: body.name, archived: false, on_hand: 0, reserved_fbs: 0, available: 0,
+              });
+            }
+          } else if (action === 'rename') {
+            dashboard.data.inventory.warehouses[0].name = body.name;
+          } else {
+            dashboard.data.inventory.warehouses[0].archived = true;
+            dashboard.data.inventory.warehouses[0].archived_at = DATE;
+          }
+          if (action === 'rename') await route.abort('failed');
+          else await route.fulfill({status: 503, json: {detail: 'База данных временно недоступна'}});
+        } else {
+          await route.fulfill({status: 409, json: {detail: 'Изменение склада отклонено'}});
+        }
+        return true;
+      };
+      await openPanel(page);
+      if (action === 'create') {
+        await page.locator('#warehouse-name').fill('Восток');
+        await page.locator('#warehouse-form button[type="submit"]').click();
+      } else if (action === 'rename') {
+        const input = page.locator(`#warehouse-rename-${NORTH}`);
+        await input.fill('Новый Север');
+        await input.locator('..').getByRole('button', {name: 'Сохранить имя'}).click();
+      } else {
+        await page.getByRole('button', {name: 'Архивировать ФФ «Север»', exact: true}).click();
+        await page.getByRole('group', {name: 'Подтверждение архивации ФФ «Север»'}).getByRole('button', {name: 'Подтвердить архивацию'}).click();
+      }
+      const error = page.locator(action === 'create' ? '#warehouse-form .form-error' : '#warehouses-error');
+      if (uncertain) await expect(error).toContainText(warehouseWarning);
+      else await expect(error).toHaveText('Изменение склада отклонено');
+      expect(dashboard.requests.filter(request => request.method !== 'GET')).toHaveLength(1);
+      await page.locator('#refresh-button').click();
+      await expect(page.locator('#refresh-button')).toBeEnabled();
+      if (uncertain) {
+        if (action === 'create') await expect(page.locator(`[data-warehouse-id="${createdId}"] h3`)).toHaveText('Восток');
+        else if (action === 'rename') await expect(page.locator(`[data-warehouse-id="${NORTH}"] h3`)).toHaveText('Новый Север');
+        else await expect(page.locator(`[data-warehouse-id="${NORTH}"] .badge.archive`)).toHaveText('Архив');
+      }
+      expect(dashboard.requests.filter(request => request.method !== 'GET')).toHaveLength(1);
+    });
+  }
+}
 
 test('hostile names remain text across matrix, operations, warehouses and history', async ({page, dashboard}) => {
   const hostile = '<img src=x onerror="window.injected=true">';

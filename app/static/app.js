@@ -296,6 +296,21 @@ function renderOperations(operations) {
   if (!operations.length) emptyRow(body, 6, "Операций пока нет");
 }
 
+function warehouseErrorMessage(error) {
+  return error.message + (error.uncertain
+    ? ' Результат изменения склада не подтверждён. Нажмите «Обновить данные» и проверьте список складов, прежде чем повторять действие.' : '');
+}
+
+function checkWarehouseResponse(warehouse) {
+  if (!warehouse || typeof warehouse.id !== "string" || !warehouse.id.trim()
+      || typeof warehouse.name !== "string" || !warehouse.name.trim()
+      || typeof warehouse.archived !== "boolean") {
+    const error = new Error("Сервер вернул некорректные данные склада.");
+    error.uncertain = true;
+    throw error;
+  }
+}
+
 async function warehouseMutation(url, method, payload, success, onSuccess = () => {}) {
   feedback($("#warehouses-error"));
   feedback($("#warehouses-status"));
@@ -304,11 +319,12 @@ async function warehouseMutation(url, method, payload, success, onSuccess = () =
       method, headers: {"Content-Type": "application/json"},
       ...(payload ? {body: JSON.stringify(payload)} : {})
     });
+    checkWarehouseResponse(result);
     onSuccess(result);
     feedback($("#warehouses-status"), success);
     await refreshAfterMutation();
   } catch (error) {
-    feedback($("#warehouses-error"), error.message);
+    feedback($("#warehouses-error"), warehouseErrorMessage(error));
   }
 }
 
@@ -493,10 +509,25 @@ function operationPayload(form) {
   return result;
 }
 
+function newOperationKey() {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+    // getRandomValues also works on HTTP origins without randomUUID.
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map(value => value.toString(16).padStart(2, "0"));
+    return [hex.slice(0, 4), hex.slice(4, 6), hex.slice(6, 8), hex.slice(8, 10), hex.slice(10)]
+      .map(part => part.join("")).join("-");
+  } catch (_) {
+    throw new Error("Не удалось создать ключ операции. Обновите страницу и повторите попытку.");
+  }
+}
+
 function newSubmission(form) {
   const labels = {};
   $$('select', form).forEach(select => {labels[select.name] = select.selectedOptions[0]?.textContent || select.value;});
-  return {payload: operationPayload(form), key: crypto.randomUUID(), labels};
+  return {payload: operationPayload(form), key: newOperationKey(), labels};
 }
 
 function checkOperationResponse(form, operation) {
@@ -528,13 +559,13 @@ $$('[data-operation-form]').forEach(form => {
     event.preventDefault();
     if (form.dataset.pending === "true") return;
     if (!form.submission && !form.reportValidity()) return;
-    if (!form.submission) rememberSubmission(form, newSubmission(form));
-    const payload = {...form.submission.payload, idempotency_key: form.submission.key};
     form.dataset.pending = "true";
-    updateFormAvailability();
     feedback($('.form-error', form));
     feedback($('.form-status', form));
     try {
+      if (!form.submission) rememberSubmission(form, newSubmission(form));
+      const payload = {...form.submission.payload, idempotency_key: form.submission.key};
+      updateFormAvailability();
       const operation = await post(form.getAttribute("action"), payload);
       checkOperationResponse(form, operation);
       rememberSubmission(form, null);
@@ -566,11 +597,12 @@ $("#warehouse-form").addEventListener("submit", async event => {
   feedback($('.form-status', form));
   try {
     const warehouse = await post(form.getAttribute("action"), {name: $('#warehouse-name').value.trim()});
+    checkWarehouseResponse(warehouse);
     $('#warehouse-name').value = "";
     feedback($('.form-status', form), `ФФ «${warehouse.name}» создан.`);
     await refreshAfterMutation();
   } catch (error) {
-    feedback($('.form-error', form), error.message);
+    feedback($('.form-error', form), warehouseErrorMessage(error));
   } finally {button.disabled = false;}
 });
 
