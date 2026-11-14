@@ -21,6 +21,16 @@ class DomainError(Exception):
         self.details = details
 
 
+def require_postgres_text(value: str) -> None:
+    """Reject text PostgreSQL/UTF-8 cannot store before issuing any SQL."""
+    if "\x00" in value:
+        raise DomainError("Текст содержит недопустимый символ", 422)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise DomainError("Текст содержит недопустимый символ", 422) from error
+
+
 def product(session: Session, product_id: UUID) -> Product:
     item = session.get(Product, product_id)
     if item is None:
@@ -65,6 +75,16 @@ def lock_balance(session: Session, product_id: UUID, warehouse_id: UUID) -> Stoc
     ).one()
 
 
+def require_available(balance: StockBalance, qty: int) -> None:
+    """Check the locked local balance; other warehouses cannot cover a shortage."""
+    if balance.available < qty:
+        raise DomainError(
+            "Недостаточно доступного товара на выбранном ФФ",
+            available_here=balance.available,
+            requested=qty,
+        )
+
+
 def create_identity(
     session: Session,
     kind: str,
@@ -78,8 +98,13 @@ def create_identity(
 ) -> tuple[Operation | None, str]:
     if type(qty) is not int or not 0 < qty <= MAX_QUANTITY:
         raise DomainError("Количество должно быть положительным целым числом", 422)
-    if not isinstance(idempotency_key, str) or not idempotency_key.strip() or len(idempotency_key) > 200:
+    if (
+        not isinstance(idempotency_key, str)
+        or not idempotency_key.strip()
+        or len(idempotency_key) > 200
+    ):
         raise DomainError("Нужен непустой ключ идемпотентности до 200 символов", 422)
+    require_postgres_text(idempotency_key)
     payload = {
         "kind": kind,
         "product_id": str(product_id),
