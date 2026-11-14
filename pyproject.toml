@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools==84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "checkstock"
+version = "0.1.0"
+description = "Local warehouse inventory prototype"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.162.5",
+    "SQLAlchemy==2.0.57",
+    "psycopg[binary]==3.3.9",
+    "alembic==1.20.1",
+    "pydantic==2.14.3",
+    "uvicorn==0.54.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.2.0", "httpx2==2.16.0"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --ignore=tests/review"
+cache_dir = "/tmp/checkstock-pytest-cache"

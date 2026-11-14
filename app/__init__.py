@@ -1,0 +1,1 @@
+"""CheckStock warehouse inventory application."""

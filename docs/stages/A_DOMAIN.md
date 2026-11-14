@@ -59,3 +59,13 @@ The HTTP 422 clarification must be carried into the later API implementation and
 - PowerShell wrapper syntax passed. PowerShell 7 rejected `-ReopenApproved` with `-Action Status` as BLOCKED/exit 3 without creating state. Windows PowerShell 5.1 passed the same check with explicit `-Repo`; its pre-existing default-parameter evaluation fails without that argument, before controller execution.
 - Document reconciliation confirmed all three P3 corrections and preserved R01-R15/T01-T14 coverage. `git diff --cached --check` passed.
 - PostgreSQL/application tests were not run: no application code is part of this candidate.
+
+## Local clarification deferred to stage B publication
+
+On 2026-11-14, the user requested resolving the remaining optional P3 from the iteration-1 review of `3bacd0dd53d94ebc38b474960ae374018e61199f`, while explicitly deferring its commit and publication to stage B and requesting no separate review for it.
+
+The local domain and acceptance documents now specify that creating a transfer draft writes exactly one `transfer_created` history event in the same transaction as the draft operation. It records SKU, quantity, source, destination, UTC time, operation ID, and draft status without changing physical stock, reservations, or transit. An identical create replay adds no event; the full lifecycle has exactly three events: created, dispatched, and received. This resolves the ambiguity in T04/T13 without adding a product feature.
+
+Verification for this local clarification: the two domain documents were reconciled against the plan's unchanged-stock draft semantics; the existing untracked service/test drafts were inspected read-only for compatibility, not executed or included in the PR; `git diff --check` passed. No additional Claude review, commit, push, or application test run is claimed for this clarification. The stage A PR remains at the previously approved published head. Carry these local edits into the next authorized stage candidate before its approval and review; stage B implementation has not started.
+
+After the user accepted and merged stage A, this clarification was carried into the authorized stage B candidate. See `B_INFRASTRUCTURE.md` for its current publication boundary and verification evidence. Transfer command implementation and the corresponding behavioral checks remain stage C work.
