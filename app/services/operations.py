@@ -252,6 +252,24 @@ def cancel_fbs(session: Session, operation_id: UUID) -> Operation:
     return operation
 
 
+def deliver_fbs(session: Session, operation_id: UUID) -> Operation:
+    """Finish customer transit without changing warehouse stock or reserves."""
+    operation, replay = _locked_transition(
+        session,
+        operation_id,
+        kind="fbs",
+        event_type="fbs_delivered",
+        required_status="shipped",
+    )
+    if replay:
+        return operation
+    # Existing shipments may finish after the source is archived or renamed.
+    warehouses = lock_warehouses(session, operation.source_warehouse_id)
+    operation.status = "delivered"
+    add_event(session, operation, "fbs_delivered", warehouses)
+    return operation
+
+
 def ship_fbo(
     session: Session,
     *,

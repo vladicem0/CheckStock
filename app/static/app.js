@@ -8,14 +8,14 @@ const stateLabels = {
   completed: ["Выполнено", "complete"], draft: ["Заявка", "draft"],
   in_transit: ["В пути", "transit"], received: ["Принято", "complete"],
   reserved: ["Резерв", "reserve"], shipped: ["В пути к клиенту", "transit"],
-  cancelled: ["Отменено", "cancelled"]
+  cancelled: ["Отменено", "cancelled"], delivered: ["Доставлено", "complete"]
 };
 const kindLabels = {receipt: "Приход", transfer: "Перемещение", fbs: "FBS", fbo: "FBO"};
 const eventLabels = {
   receipt_completed: "Приход на ФФ", transfer_created: "Создана заявка",
   transfer_dispatched: "Перемещение отправлено", transfer_received: "Перемещение принято",
   fbs_reserved: "Создан резерв FBS", fbs_shipped: "FBS отправлен клиенту",
-  fbs_cancelled: "Резерв FBS отменён", fbo_shipped: "FBO отправлен",
+  fbs_cancelled: "Резерв FBS отменён", fbs_delivered: "FBS доставлен клиенту", fbo_shipped: "FBO отправлен",
   fbo_received: "FBO принят маркетплейсом"
 };
 let latestLoad = 0;
@@ -288,6 +288,7 @@ function renderOperations(operations) {
     if (operation.kind === "fbs" && operation.status === "reserved") {
       actions.append(actionButton(operation, "Отправить", "ship"), actionButton(operation, "Отменить", "cancel"));
     }
+    if (operation.kind === "fbs" && operation.status === "shipped") actions.append(actionButton(operation, "Подтвердить доставку", "deliver"));
     if (operation.kind === "fbo" && operation.status === "in_transit") actions.append(actionButton(operation, "Принять FBO", "receive"));
     if (!actions.children.length) actions.append(node("span", "action-note", operation.status === "shipped" ? "Едет клиенту" : "Завершено"));
     cell(row, actions);

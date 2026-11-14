@@ -14,7 +14,7 @@ from app.db import get_session
 from app.main import app
 from app.services import operations, stock as stock_services
 from app.services.stock import DomainError
-from tests.helpers import NORTH, SOUTH, P101, P102, P103
+from tests.helpers import NORTH, SOUTH, P101, P102, P103, snapshot as database_snapshot
 
 
 @pytest.fixture
@@ -77,7 +77,7 @@ CREATE_ROUTES = [
 
 TRANSITION_ROUTES = [
     "/api/transfers/{id}/dispatch", "/api/transfers/{id}/receive",
-    "/api/fbs/{id}/ship", "/api/fbs/{id}/cancel", "/api/fbo/{id}/receive",
+    "/api/fbs/{id}/ship", "/api/fbs/{id}/cancel", "/api/fbs/{id}/deliver", "/api/fbo/{id}/receive",
 ]
 
 
@@ -123,6 +123,78 @@ def test_api_t03_fbs_cancel_and_reject_shipping(client):
     post(client, f"/api/fbs/{operation_id}/cancel")
     assert client.post(f"/api/fbs/{operation_id}/ship").status_code == 409
     assert http_snapshot(client) == before
+
+
+def test_api_fbs_delivery_finishes_transit_without_touching_other_reserves(client, db):
+    payload = fbs_payload(key="delivery-http")
+    operation_id = post(client, "/api/fbs/reservations", payload)["id"]
+    post(client, f"/api/fbs/{operation_id}/ship")
+    post(client, "/api/fbs/reservations", fbs_payload(qty=1, key="other-reservation"))
+    before = get(client, "/api/stocks")
+    history_before = get(client, "/api/history")
+    assert stock(client) == (6, 1, 5)
+    assert before["totals"]["transit_fbs"] == 4
+
+    delivered = post(client, f"/api/fbs/{operation_id}/deliver")
+    assert (delivered["id"], delivered["kind"], delivered["status"], delivered["qty"]) == (
+        operation_id, "fbs", "delivered", 4,
+    )
+    after = get(client, "/api/stocks")
+    assert after["balances"] == before["balances"]
+    assert after["totals"] == dict(before["totals"], transit_fbs=0)
+    assert after["transit"] == {"ff": [], "fbo": [], "fbs": []}
+    assert next(item for item in get(client, "/api/operations") if item["id"] == operation_id) == delivered
+    history = get(client, "/api/history")
+    old_ids = {item["id"] for item in history_before}
+    new_events = [item for item in history if item["id"] not in old_ids]
+    assert len(new_events) == 1
+    event = new_events[0]
+    assert (event["operation_id"], event["event_type"], event["operation_status"], event["qty"]) == (
+        operation_id, "fbs_delivered", "delivered", 4,
+    )
+    assert event["from_name"] == "Север" and event["to_name"] == "Клиент"
+    assert event["from_warehouse_id"] == str(NORTH) and event["to_warehouse_id"] is None
+    assert [item for item in history if item["id"] in old_ids] == history_before
+
+    rows, http_state = database_snapshot(db), http_snapshot(client)
+    assert post(client, f"/api/fbs/{operation_id}/deliver") == delivered
+    assert post(client, f"/api/fbs/{operation_id}/ship") == delivered
+    assert post(client, "/api/fbs/reservations", payload) == delivered
+    assert client.post(f"/api/fbs/{operation_id}/cancel").status_code == 409
+    assert database_snapshot(db) == rows
+    assert http_snapshot(client) == http_state
+
+
+@pytest.mark.parametrize("status", ["reserved", "cancelled"])
+def test_api_fbs_delivery_rejects_unshipped_operations_atomically(client, db, status):
+    operation = post(client, "/api/fbs/reservations", fbs_payload())
+    if status == "cancelled":
+        post(client, f"/api/fbs/{operation['id']}/cancel")
+    rows, before = database_snapshot(db), http_snapshot(client)
+    response = client.post(f"/api/fbs/{operation['id']}/deliver")
+    assert response.status_code == 409
+    assert isinstance(response.json()["detail"], str)
+    assert database_snapshot(db) == rows
+    assert http_snapshot(client) == before
+
+
+def test_api_fbs_delivery_failure_rolls_back_status_and_inserted_event(client, db, monkeypatch):
+    operation = post(client, "/api/fbs/reservations", fbs_payload())
+    post(client, f"/api/fbs/{operation['id']}/ship")
+    original_add_event = operations.add_event
+    before = database_snapshot(db)
+
+    def fail_after_delivery_event(session, *args, **kwargs):
+        original_add_event(session, *args, **kwargs)
+        session.flush()
+        raise OperationalError("private-delivery-statement", None, RuntimeError("private-delivery-error"))
+
+    monkeypatch.setattr(operations, "add_event", fail_after_delivery_event)
+    response = client.post(f"/api/fbs/{operation['id']}/deliver")
+    assert response.status_code == 503
+    assert "private-delivery" not in response.text
+    assert database_snapshot(db) == before
+    assert get(client, "/api/stocks")["totals"]["transit_fbs"] == 4
 
 
 def test_api_t04_transfer_all_steps_and_repeated_confirmations(client):
@@ -519,22 +591,31 @@ def test_concurrent_http_reservations_have_independent_transactions(client, db, 
     assert len([item for item in get(client, "/api/history") if item["operation_id"] == winner]) == 1
 
 
-def test_concurrent_http_confirmation_has_one_effect(client, monkeypatch):
+@pytest.mark.parametrize("action", ["ship", "deliver"])
+def test_concurrent_http_confirmation_has_one_effect(client, monkeypatch, action):
     operation = post(client, "/api/fbs/reservations", fbs_payload(qty=2))
-    original = operations.ship_fbs
+    if action == "deliver":
+        post(client, f"/api/fbs/{operation['id']}/ship")
+    original = getattr(operations, f"{action}_fbs")
     barrier = Barrier(2, timeout=10)
+    backend_pids = []
 
     def synchronized_ship(session, operation_id):
-        session.execute(text("SELECT 1"))
+        backend_pids.append(session.scalar(text("SELECT pg_backend_pid()")))
         barrier.wait()
         return original(session, operation_id)
 
-    monkeypatch.setattr(operations, "ship_fbs", synchronized_ship)
+    monkeypatch.setattr(operations, f"{action}_fbs", synchronized_ship)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(client.post, f"/api/fbs/{operation['id']}/ship") for _ in range(2)]
+        futures = [pool.submit(client.post, f"/api/fbs/{operation['id']}/{action}") for _ in range(2)]
         responses = [future.result(timeout=20) for future in futures]
     assert [response.status_code for response in responses] == [200, 200]
+    assert len(set(backend_pids)) == 2
+    assert responses[0].json() == responses[1].json()
+    assert responses[0].json()["status"] == ("delivered" if action == "deliver" else "shipped")
     assert {response.json()["id"] for response in responses} == {operation["id"]}
     assert stock(client) == (8, 0, 8)
-    assert get(client, "/api/stocks")["totals"]["transit_fbs"] == 2
-    assert len([item for item in get(client, "/api/history") if item["operation_id"] == operation["id"]]) == 2
+    assert get(client, "/api/stocks")["totals"]["transit_fbs"] == (0 if action == "deliver" else 2)
+    assert len([item for item in get(client, "/api/history") if item["operation_id"] == operation["id"]]) == (
+        3 if action == "deliver" else 2
+    )

@@ -32,7 +32,7 @@ Python 3.12, synchronous FastAPI, SQLAlchemy 2 with psycopg, PostgreSQL 17, and 
 
 A receipt immediately increases the recipient's physical balance. A transfer progresses from `draft` to `in_transit` to `received`: creation changes no balance, dispatch removes physical stock from the source, and receipt adds it at the destination. FBS reservation changes only the reserve; cancellation releases it; shipment reduces both physical stock and reserve. FBO shipment removes physical stock; marketplace receipt ends transit without returning stock to a warehouse.
 
-Transit is derived from operations: transfer/`in_transit`, fbo/`in_transit`, and fbs/`shipped`. FBS delivery completion is outside the current scope.
+Transit is derived from operations: transfer/`in_transit`, fbo/`in_transit`, and fbs/`shipped`. The user-authorized fbs-delivery extension adds shipped -> delivered. Delivery removes the shipment from FBS transit without changing stock or reserves, and atomically appends fbs_delivered. Repeated delivery and an earlier ship replay return the current state without another event. Existing shipments can finish after source archival. A forward migration preserves existing data; downgrade refuses while delivered operations exist.
 
 Require nonnegative balances, reserve no greater than physical stock, positive quantities, valid type/status combinations, unique balance pairs, unique creation keys, and one event per operation transition. Balance changes, operation status, and history must commit atomically. Concurrency must not cause duplicate movements or excessive reservations.
 
