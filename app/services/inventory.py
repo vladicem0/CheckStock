@@ -1,17 +1,26 @@
 """Read models with transaction boundaries and isolation owned by the caller.
 
-For a combined report, provide a fresh session and select REPEATABLE READ before
-its first SQL statement. These functions issue multiple reads and do not start,
-commit, or change the isolation of a caller's transaction. A previously used
-session may also contain stale ORM instances and is not a fresh report snapshot.
+Callers select PostgreSQL REPEATABLE READ or SERIALIZABLE before the transaction's
+first SQL statement. Aggregate readers verify the active isolation and refresh
+ORM instances from that snapshot, including objects retained from an earlier
+transaction. They never commit or change a caller's transaction isolation.
 """
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.models import Operation, Product, StockBalance, StockEvent, Warehouse
+
+
+def _require_report_snapshot(session: Session) -> None:
+    isolation = session.scalar(text("SHOW transaction_isolation"))
+    if isolation not in {"repeatable read", "serializable"}:
+        raise RuntimeError(
+            "Reports require REPEATABLE READ or SERIALIZABLE; "
+            "configure the caller's transaction before its first SQL statement"
+        )
 
 
 def warehouse_view(warehouse: Warehouse) -> dict[str, Any]:
@@ -21,9 +30,15 @@ def warehouse_view(warehouse: Warehouse) -> dict[str, Any]:
 
 def operation_view(session: Session, operation: Operation) -> dict[str, Any]:
     """Project current warehouse names; historical snapshots belong to events."""
-    product = session.get(Product, operation.product_id)
-    source = session.get(Warehouse, operation.source_warehouse_id) if operation.source_warehouse_id else None
-    destination = session.get(Warehouse, operation.destination_warehouse_id) if operation.destination_warehouse_id else None
+    product = session.get(Product, operation.product_id, populate_existing=True)
+    source = (
+        session.get(Warehouse, operation.source_warehouse_id, populate_existing=True)
+        if operation.source_warehouse_id else None
+    )
+    destination = (
+        session.get(Warehouse, operation.destination_warehouse_id, populate_existing=True)
+        if operation.destination_warehouse_id else None
+    )
     return dict(id=operation.id, kind=operation.kind, status=operation.status,
                 product_id=product.id, sku=product.sku, product_name=product.name, qty=operation.qty,
                 source_warehouse_id=operation.source_warehouse_id,
@@ -35,21 +50,33 @@ def operation_view(session: Session, operation: Operation) -> dict[str, Any]:
 
 
 def list_operations(session: Session) -> list[dict[str, Any]]:
+    _require_report_snapshot(session)
     return [operation_view(session, operation) for operation in session.scalars(
-        select(Operation).order_by(Operation.created_at.desc(), Operation.id))]
+        select(Operation).order_by(Operation.created_at.desc(), Operation.id)
+        .execution_options(populate_existing=True))]
 
 
 def list_history(session: Session) -> list[dict[str, Any]]:
     """Return immutable event fields, including names and status at event time."""
+    _require_report_snapshot(session)
     return [{column.name: getattr(event, column.name) for column in StockEvent.__table__.columns}
-            for event in session.scalars(select(StockEvent).order_by(StockEvent.created_at.desc(), StockEvent.id))]
+            for event in session.scalars(
+                select(StockEvent).order_by(StockEvent.created_at.desc(), StockEvent.id)
+                .execution_options(populate_existing=True))]
 
 
 def get_inventory(session: Session) -> dict[str, Any]:
     """Read all SKU/FF combinations and three transit kinds in the given snapshot."""
-    products = session.scalars(select(Product).order_by(Product.sku)).all()
-    warehouses = session.scalars(select(Warehouse).order_by(Warehouse.created_at, Warehouse.id)).all()
-    balances = {(b.product_id, b.warehouse_id): b for b in session.scalars(select(StockBalance))}
+    _require_report_snapshot(session)
+    products = session.scalars(
+        select(Product).order_by(Product.sku).execution_options(populate_existing=True)
+    ).all()
+    warehouses = session.scalars(
+        select(Warehouse).order_by(Warehouse.created_at, Warehouse.id)
+        .execution_options(populate_existing=True)
+    ).all()
+    balances = {(b.product_id, b.warehouse_id): b for b in session.scalars(
+        select(StockBalance).execution_options(populate_existing=True))}
     cells = []
     for product in products:
         for warehouse in warehouses:
@@ -61,7 +88,8 @@ def get_inventory(session: Session) -> dict[str, Any]:
                               on_hand=physical, reserved_fbs=reserved, available=physical-reserved))
     transit = {"ff": [], "fbo": [], "fbs": []}
     for operation in session.scalars(select(Operation).where(Operation.status.in_(["in_transit", "shipped"]))
-                                    .order_by(Operation.created_at, Operation.id)):
+                                    .order_by(Operation.created_at, Operation.id)
+                                    .execution_options(populate_existing=True)):
         category = "ff" if operation.kind == "transfer" else operation.kind
         transit[category].append(operation_view(session, operation))
     totals = {field: sum(cell[field] for cell in cells) for field in ("on_hand", "reserved_fbs", "available")}

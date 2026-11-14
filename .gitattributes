@@ -1,1 +1,2 @@
 scripts/review/*.sh text eol=lf
+app/static/vendor/* -text -whitespace
