@@ -1,6 +1,8 @@
 """Synchronous HTTP API, local OpenAPI documentation and PostgreSQL readiness."""
 
+import logging
 from pathlib import Path
+from traceback import extract_tb
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -8,14 +10,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError, SQLAlchemyError, TimeoutError
 from sqlalchemy.orm import Session
 
 from app.api import inventory, operations, warehouses
 from app.db import get_session
 from app.schemas import ErrorView
 from app.services.stock import DomainError
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="CheckStock",
@@ -26,10 +31,11 @@ app = FastAPI(
 )
 
 app.mount(
-    "/static/vendor",
-    StaticFiles(directory=Path(__file__).resolve().parent / "static" / "vendor"),
-    name="swagger-assets",
+    "/static",
+    StaticFiles(directory=Path(__file__).resolve().parent / "static"),
+    name="static",
 )
+templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templates")
 
 ERROR_RESPONSES = {
     404: {"model": ErrorView, "description": "Товар, склад или операция не найдены"},
@@ -86,10 +92,29 @@ async def validation_error(_request: Request, error: RequestValidationError) -> 
     )
 
 
+def _log_database_error(error: SQLAlchemyError, status_code: int) -> None:
+    # Keep diagnostic locations without SQL, bound parameters, driver messages,
+    # request bodies or frame locals, which may contain private data.
+    locations = " -> ".join(
+        f"{frame.filename}:{frame.lineno} in {frame.name}"
+        for frame in extract_tb(error.__traceback__)
+    )
+    logger.error(
+        "Database request failed: type=%s status=%s traceback=%s",
+        type(error).__name__, status_code, locations,
+    )
+
+
 @app.exception_handler(SQLAlchemyError)
-async def database_error(_request: Request, _error: SQLAlchemyError) -> JSONResponse:
+async def database_error(_request: Request, error: SQLAlchemyError) -> JSONResponse:
     # Transaction contexts have rolled back before errors reach this boundary.
-    return JSONResponse(status_code=503, content={"detail": "База данных временно недоступна"})
+    unavailable = isinstance(error, (OperationalError, InterfaceError, TimeoutError)) or (
+        isinstance(error, DBAPIError) and error.connection_invalidated
+    )
+    status_code = 503 if unavailable else 500
+    _log_database_error(error, status_code)
+    detail = "База данных временно недоступна" if unavailable else "Внутренняя ошибка сервера"
+    return JSONResponse(status_code=status_code, content={"detail": detail})
 
 
 @app.exception_handler(Exception)
@@ -109,11 +134,20 @@ def api_documentation() -> HTMLResponse:
     )
 
 
+@app.get("/", include_in_schema=False, response_class=HTMLResponse)
+def dashboard(request: Request) -> HTMLResponse:
+    """Render a local shell; inventory reads and commands use the existing API."""
+    return templates.TemplateResponse(
+        request=request, name="index.html", headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/health", responses={503: {"model": ErrorView}}, tags=["Готовность"])
 def health(session: Annotated[Session, Depends(get_session)]) -> dict[str, str]:
     """Report readiness only when a database query succeeds."""
     try:
         session.execute(text("SELECT 1"))
     except SQLAlchemyError as error:
+        _log_database_error(error, 503)
         raise HTTPException(status_code=503, detail="База данных недоступна") from error
     return {"status": "ok"}

@@ -1,13 +1,14 @@
-"""Regression checks for report isolation and retained ORM state (deferred to D)."""
+"""Regression checks for report isolation, retained ORM state and query growth."""
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from app.models import Operation, Product, StockBalance, Warehouse
 from app.services.inventory import get_inventory, list_history, list_operations, operation_view
 from app.services.operations import (
-    create_transfer, dispatch_transfer, receive_transfer, reserve_fbs, ship_fbs,
+    create_transfer, dispatch_transfer, receive_transfer, reserve_fbs, ship_fbo, ship_fbs,
 )
+from app.services.stock import receive_stock
 from app.services.warehouses import rename_warehouse
 from tests.helpers import NORTH, SOUTH, P101, run, snapshot
 
@@ -142,3 +143,63 @@ def test_single_command_projection_remains_available_in_write_transaction(db):
         assert response["id"] == operation.id and response["status"] == "reserved"
         assert response["source_name"] == "Север" and response["qty"] == 1
         assert session.scalar(text("SHOW transaction_isolation")) == "read committed"
+
+
+@pytest.mark.parametrize("reader,query_budget", [(list_operations, 4), (get_inventory, 5)])
+def test_report_queries_stay_bounded_as_operation_history_grows(db, reader, query_budget):
+    def read_with_query_count():
+        statements = []
+
+        def record_query(_connection, _cursor, statement, _parameters, _context, _many):
+            statements.append(statement)
+
+        # A fresh session prevents an identity-map cache from hiding query growth.
+        with db.begin() as session:
+            connection = session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+            event.listen(connection, "before_cursor_execute", record_query)
+            try:
+                result = reader(session)
+            finally:
+                event.remove(connection, "before_cursor_execute", record_query)
+        return result, len(statements)
+
+    _initial, initial_count = read_with_query_count()
+    with db.begin() as session:
+        receive_stock(session, product_id=P101, warehouse_id=NORTH, qty=30,
+                      idempotency_key="report-query-stock")
+        for index in range(10):
+            transfer = create_transfer(
+                session, product_id=P101, source_warehouse_id=NORTH,
+                destination_warehouse_id=SOUTH, qty=1,
+                idempotency_key=f"report-query-transfer-{index}",
+            )
+            dispatch_transfer(session, transfer.id)
+            reservation = reserve_fbs(
+                session, product_id=P101, warehouse_id=NORTH, qty=1,
+                customer="Клиент", idempotency_key=f"report-query-fbs-{index}",
+            )
+            ship_fbs(session, reservation.id)
+            ship_fbo(session, product_id=P101, warehouse_id=NORTH, qty=1,
+                     marketplace="Маркетплейс", idempotency_key=f"report-query-fbo-{index}")
+
+    before = snapshot(db)
+    report, populated_count = read_with_query_count()
+    assert 0 < populated_count <= query_budget
+    assert populated_count == initial_count
+    if reader is list_operations:
+        assert len(report) == 35  # Four seed receipts, the replenishment, 30 shipments.
+        transfers = [row for row in report if row["kind"] == "transfer"]
+        assert len(transfers) == 10
+        assert all(row["source_name"] == "Север" and row["destination_name"] == "Юг"
+                   for row in transfers)
+    else:
+        assert report["totals"] == {
+            "on_hand": 25, "reserved_fbs": 0, "available": 25,
+            "transit_ff": 10, "transit_fbo": 10, "transit_fbs": 10,
+        }
+        assert all(len(rows) == 10 for rows in report["transit"].values())
+        assert all(row["source_name"] == "Север" and row["product_name"] == "Органайзер"
+                   for rows in report["transit"].values() for row in rows)
+        assert all(row["destination_name"] == "Маркетплейс" for row in report["transit"]["fbo"])
+        assert all(row["destination_name"] == "Клиент" for row in report["transit"]["fbs"])
+    assert snapshot(db) == before
