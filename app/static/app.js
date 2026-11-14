@@ -301,6 +301,16 @@ function warehouseErrorMessage(error) {
     ? ' Результат изменения склада не подтверждён. Нажмите «Обновить данные» и проверьте список складов, прежде чем повторять действие.' : '');
 }
 
+function checkWarehouseResponse(warehouse) {
+  if (!warehouse || typeof warehouse.id !== "string" || !warehouse.id.trim()
+      || typeof warehouse.name !== "string" || !warehouse.name.trim()
+      || typeof warehouse.archived !== "boolean") {
+    const error = new Error("Сервер вернул некорректные данные склада.");
+    error.uncertain = true;
+    throw error;
+  }
+}
+
 async function warehouseMutation(url, method, payload, success, onSuccess = () => {}) {
   feedback($("#warehouses-error"));
   feedback($("#warehouses-status"));
@@ -309,6 +319,7 @@ async function warehouseMutation(url, method, payload, success, onSuccess = () =
       method, headers: {"Content-Type": "application/json"},
       ...(payload ? {body: JSON.stringify(payload)} : {})
     });
+    checkWarehouseResponse(result);
     onSuccess(result);
     feedback($("#warehouses-status"), success);
     await refreshAfterMutation();
@@ -586,6 +597,7 @@ $("#warehouse-form").addEventListener("submit", async event => {
   feedback($('.form-status', form));
   try {
     const warehouse = await post(form.getAttribute("action"), {name: $('#warehouse-name').value.trim()});
+    checkWarehouseResponse(warehouse);
     $('#warehouse-name').value = "";
     feedback($('.form-status', form), `ФФ «${warehouse.name}» создан.`);
     await refreshAfterMutation();
