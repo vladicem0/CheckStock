@@ -66,6 +66,7 @@ class LocalReviewTests(unittest.TestCase):
             ssh_user="dev",
             remote_script="/home/dev/bin/review-stage.sh",
             timeout=960,
+            reopen_approved=False,
         )
         self.directory = self.args.state_dir / self.args.stage
         self.base = review.local_head(self.repo)
@@ -101,7 +102,10 @@ class LocalReviewTests(unittest.TestCase):
         head = review.local_head(self.repo)
         state = self.state()
         iteration = state["iteration"]
-        if state.get("last_reviewed_head") != head and state.get("last_review_status") == "CHANGES_REQUESTED":
+        if state.get("last_reviewed_head") != head and (
+            state.get("last_review_status") == "CHANGES_REQUESTED"
+            or (state.get("last_review_status") == "APPROVED" and self.args.reopen_approved)
+        ):
             iteration += 1
         result = verdict(self.base, head, status, iteration=iteration)
         with patch.object(review, "invoke_review", return_value=completed(result, code)) as transport:
@@ -149,6 +153,7 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(metadata["finding_counts"], {"P0": 0, "P1": 0, "P2": 0, "P3": 0})
         self.assertEqual(metadata["attempt"], 1)
         self.assertEqual(metadata["iteration"], 0)
+        self.assertIs(metadata["reopen_approved"], False)
         self.assertEqual((log / "stderr.txt").read_text(), "diagnostic output")
 
     def test_changes_requested_is_normal_exit_two(self):
@@ -295,6 +300,214 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual((result["status"], code), ("BLOCKED", 3))
         self.assertIn("start a new stage", result["summary"])
         transport.assert_not_called()
+
+    def prepare_approved_correction(self):
+        self.start()
+        approved_head = self.commit("implementation\n")
+        result, code, _ = self.run_result()
+        self.assertEqual((result["status"], code), ("APPROVED", 0))
+        head = self.commit("authorized correction\n")
+        self.args.reopen_approved = True
+        return approved_head, head
+
+    def test_reopen_approved_preserves_base_and_prior_run_logs(self):
+        approved_head, head = self.prepare_approved_correction()
+        old_run = self.directory / "runs" / self.state()["last_run"]
+        old_files = {path.name: path.read_bytes() for path in old_run.iterdir()}
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("APPROVED", 0))
+        transport.assert_called_once_with(self.args, self.base, head, 1)
+        state = self.state()
+        self.assertEqual(state["base_sha"], self.base)
+        self.assertEqual(state["last_reviewed_head"], head)
+        self.assertEqual(state["iteration"], 1)
+        self.assertEqual(state["attempts"], 2)
+        self.assertEqual({path.name: path.read_bytes() for path in old_run.iterdir()}, old_files)
+        self.assertEqual(json.loads(old_files["result.json"])["head_sha"], approved_head)
+        new_run = self.directory / "runs" / state["last_run"]
+        self.assertNotEqual(new_run, old_run)
+        metadata = json.loads((new_run / "metadata.json").read_text())
+        self.assertIs(metadata["reopen_approved"], True)
+        self.assertEqual(metadata["base_sha"], self.base)
+        self.assertEqual(metadata["head_sha"], head)
+        self.assertEqual(metadata["iteration"], 1)
+
+    def test_opt_in_can_follow_default_denial_without_losing_prior_approval(self):
+        approved_head, head = self.prepare_approved_correction()
+        self.args.reopen_approved = False
+        denied, code, transport = self.run_result()
+        self.assertEqual((denied["status"], code), ("BLOCKED", 3))
+        transport.assert_not_called()
+        self.assertEqual(self.state()["last_result"]["status"], "BLOCKED")
+        self.assertEqual(self.state()["last_review_status"], "APPROVED")
+        self.assertEqual(self.state()["last_reviewed_head"], approved_head)
+        self.assertEqual(self.state()["iteration"], 0)
+        self.args.reopen_approved = True
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("APPROVED", 0))
+        transport.assert_called_once_with(self.args, self.base, head, 1)
+
+    def test_reopen_requires_prior_approval(self):
+        self.start()
+        self.commit("implementation\n")
+        self.args.reopen_approved = True
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("BLOCKED", 3))
+        self.assertIn("requires a prior APPROVED", result["summary"])
+        transport.assert_not_called()
+        self.assertIsNone(self.state()["last_reviewed_head"])
+        self.args.reopen_approved = False
+        self.run_result("CHANGES_REQUESTED")
+        self.commit("ordinary correction\n")
+        self.args.reopen_approved = True
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("BLOCKED", 3))
+        self.assertIn("requires a prior APPROVED", result["summary"])
+        transport.assert_not_called()
+        self.assertEqual(self.state()["iteration"], 0)
+
+    def test_reopen_rejects_unchanged_approved_head(self):
+        self.start()
+        head = self.commit("implementation\n")
+        self.run_result()
+        self.args.reopen_approved = True
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("BLOCKED", 3))
+        self.assertIn("requires a changed head", result["summary"])
+        transport.assert_not_called()
+        self.assertEqual(self.state()["last_reviewed_head"], head)
+        self.assertEqual(self.state()["last_review_status"], "APPROVED")
+        self.assertEqual(self.state()["iteration"], 0)
+
+    def test_reopen_flag_is_review_only_and_invalid_actions_create_no_state(self):
+        common = ["--stage", self.args.stage, "--repo", str(self.repo),
+                  "--state-dir", str(self.args.state_dir)]
+        self.assertFalse(review.parse_arguments(["review", *common]).reopen_approved)
+        self.assertTrue(review.parse_arguments(["review", *common, "--reopen-approved"]).reopen_approved)
+        for action in ("start", "status"):
+            with self.subTest(action=action):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = review.main([action, *common, "--reopen-approved"])
+                result = json.loads(output.getvalue())
+                self.assertEqual((result["status"], code), ("BLOCKED", 3))
+                self.assertIn("only with the review action", result["summary"])
+                self.assertFalse(self.args.state_dir.exists())
+
+    def test_reopening_uses_the_existing_three_correction_limit(self):
+        self.start()
+        self.commit("implementation\n")
+        self.run_result()
+        self.args.reopen_approved = True
+        for iteration in range(1, 4):
+            head = self.commit(f"authorized correction {iteration}\n")
+            result, code, transport = self.run_result()
+            self.assertEqual((result["status"], code), ("APPROVED", 0))
+            transport.assert_called_once_with(self.args, self.base, head, iteration)
+            self.assertEqual(self.state()["base_sha"], self.base)
+        previous = self.state()["last_reviewed_head"]
+        self.commit("fourth correction\n")
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("BLOCKED", 3))
+        self.assertIn("exhausted", result["summary"])
+        transport.assert_not_called()
+        self.assertEqual(self.state()["iteration"], 3)
+        self.assertEqual(self.state()["last_reviewed_head"], previous)
+
+    def test_reopened_changes_requested_then_normal_fix_share_the_budget(self):
+        _, reopened_head = self.prepare_approved_correction()
+        result, code, transport = self.run_result("CHANGES_REQUESTED")
+        self.assertEqual((result["status"], code), ("CHANGES_REQUESTED", 2))
+        transport.assert_called_once_with(self.args, self.base, reopened_head, 1)
+        self.args.reopen_approved = False
+        corrected_head = self.commit("reviewer requested correction\n")
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("APPROVED", 0))
+        transport.assert_called_once_with(self.args, self.base, corrected_head, 2)
+        self.assertEqual(self.state()["iteration"], 2)
+        self.assertEqual(self.state()["base_sha"], self.base)
+
+    def test_reopened_transport_blocked_retry_without_flag_keeps_reserved_iteration(self):
+        _, head = self.prepare_approved_correction()
+        failure = subprocess.CompletedProcess(["ssh"], 255, "", "Connection refused")
+        with patch.object(review, "invoke_review", return_value=failure) as transport:
+            result, code = review.review_stage(self.args, self.directory)
+        self.assertEqual((result["status"], code), ("BLOCKED", 3))
+        transport.assert_called_once_with(self.args, self.base, head, 1)
+        state = self.state()
+        self.assertEqual(state["iteration"], 1)
+        self.assertEqual(state["last_reviewed_head"], head)
+        self.assertIsNone(state["last_review_status"])
+        blocked_run = self.directory / "runs" / state["last_run"]
+        blocked_metadata = json.loads((blocked_run / "metadata.json").read_text())
+        self.assertIs(blocked_metadata["reopen_approved"], True)
+        self.assertEqual((blocked_run / "stderr.txt").read_text(), "Connection refused")
+        self.args.reopen_approved = False
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("APPROVED", 0))
+        transport.assert_called_once_with(self.args, self.base, head, 1)
+        self.assertEqual(self.state()["iteration"], 1)
+        retry_run = self.directory / "runs" / self.state()["last_run"]
+        retry_metadata = json.loads((retry_run / "metadata.json").read_text())
+        self.assertIs(retry_metadata["reopen_approved"], False)
+        self.assertEqual(json.loads((blocked_run / "metadata.json").read_text()), blocked_metadata)
+
+    def test_reopen_does_not_bypass_dirty_tracked_guard(self):
+        approved_head, _ = self.prepare_approved_correction()
+        (self.repo / "sample.txt").write_text("uncommitted work\n", encoding="utf-8")
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("BLOCKED", 3))
+        self.assertIn("Tracked changes", result["summary"])
+        transport.assert_not_called()
+        self.assertEqual(self.state()["iteration"], 0)
+        self.assertEqual(self.state()["last_reviewed_head"], approved_head)
+
+    def test_reopen_does_not_bypass_published_head_guard(self):
+        approved_head, _ = self.prepare_approved_correction()
+        self.remote.side_effect = None
+        self.remote.return_value = approved_head
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("BLOCKED", 3))
+        self.assertIn("differ", result["summary"])
+        transport.assert_not_called()
+        self.assertEqual(self.state()["iteration"], 0)
+        self.assertEqual(self.state()["last_reviewed_head"], approved_head)
+
+    def test_reopen_requires_descendant_of_prior_approved_head(self):
+        approved_head, _ = self.prepare_approved_correction()
+        # This is a disposable fixture repository, never the real project checkout.
+        self.git("checkout", "-B", "dev", self.base)
+        self.commit("alternate history from the original base\n")
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("BLOCKED", 3))
+        self.assertIn("must descend", result["summary"])
+        transport.assert_not_called()
+        self.assertEqual(self.state()["base_sha"], self.base)
+        self.assertEqual(self.state()["iteration"], 0)
+        self.assertEqual(self.state()["last_reviewed_head"], approved_head)
+
+    def test_reopened_wrong_sha_verdict_remains_blocked(self):
+        approved_head, head = self.prepare_approved_correction()
+        wrong = verdict(self.base, approved_head, iteration=1)
+        with patch.object(review, "invoke_review", return_value=completed(wrong)) as transport:
+            result, code = review.review_stage(self.args, self.directory)
+        self.assertEqual((result["status"], code), ("BLOCKED", 3))
+        transport.assert_called_once_with(self.args, self.base, head, 1)
+        self.assertEqual(self.state()["iteration"], 1)
+        self.assertIsNone(self.state()["last_review_status"])
+        self.args.reopen_approved = False
+        result, code, transport = self.run_result()
+        self.assertEqual((result["status"], code), ("APPROVED", 0))
+        transport.assert_called_once_with(self.args, self.base, head, 1)
+
+    def test_reopened_verdict_is_invalidated_if_remote_moves(self):
+        _, head = self.prepare_approved_correction()
+        self.remote.side_effect = [head, "f" * 40]
+        with patch.object(review, "invoke_review", return_value=completed(verdict(self.base, head, iteration=1))):
+            result, code = review.review_stage(self.args, self.directory)
+        self.assertEqual((result["status"], code), ("BLOCKED", 3))
+        self.assertEqual(self.state()["iteration"], 1)
+        self.assertIsNone(self.state()["last_review_status"])
 
     def test_empty_stage_range_is_blocked_before_transport(self):
         self.start()

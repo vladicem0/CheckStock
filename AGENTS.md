@@ -23,7 +23,7 @@ The active coding agent follows this workflow for each implementation stage. Thi
 
 Handle review results as follows:
 
-- `APPROVED`: accept only a valid result for the recorded base and the exact reviewed commit. Report the result when the required checks also pass, then wait for the user-owned main handoff. Approval does not cover later commits; `status` rejects an approval if local or published HEAD has changed.
+- `APPROVED`: accept only a valid result for the recorded base and the exact reviewed commit. Report the result when the required checks also pass, then wait for the user-owned main handoff. Approval does not cover later commits; `status` rejects an approval if local or published HEAD has changed. If the user explicitly requests further corrections within the same stage after approval, use `review --reopen-approved` for the changed published head. This retains the original base and consumes one of the same three correction rounds; it does not authorize unrelated work or a new stage.
 - `CHANGES_REQUESTED`: inspect every finding, make the necessary scoped fixes, rerun affected checks, commit and publish the fixes, then review again with the original base. Each review covers the entire stage, not just the latest fix.
 - `BLOCKED`: stop the review cycle and report the concrete blocker. Do not treat missing credentials, failed commands, timeouts, invalid output, missing evidence, or an unavailable reviewer as approval.
 

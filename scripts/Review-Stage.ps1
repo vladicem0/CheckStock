@@ -11,11 +11,15 @@ param(
     [string]$SshHost = 'vpn',
     [string]$SshUser = 'dev',
     [string]$RemoteScript = '/home/dev/bin/review-stage.sh',
-    [int]$TimeoutSeconds = 960
+    [int]$TimeoutSeconds = 960,
+    [switch]$ReopenApproved
 )
 
 $ErrorActionPreference = 'Stop'
 try {
+    if ($ReopenApproved -and $Action -ne 'Review') {
+        throw '-ReopenApproved is allowed only with the Review action.'
+    }
     $pythonCommand = Get-Command python -ErrorAction Stop
     $controllerPath = Join-Path $PSScriptRoot 'review/local_review.py'
     $controllerArguments = @(
@@ -30,6 +34,9 @@ try {
     )
     if ($StateDir) {
         $controllerArguments += @('--state-dir', $StateDir)
+    }
+    if ($ReopenApproved) {
+        $controllerArguments += '--reopen-approved'
     }
     & $pythonCommand.Source @controllerArguments
     exit $LASTEXITCODE

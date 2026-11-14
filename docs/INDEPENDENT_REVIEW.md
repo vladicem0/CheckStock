@@ -84,7 +84,7 @@ Untracked files are deliberately excluded from review. At initial integration, t
 
 ## Implement, verify, commit, and review
 
-Implement the authorized stage, run the appropriate checks on its exact candidate tree, and present the stage summary for user approval. After that approval, commit only the intended files on `dev` using an English message. Publish the commit to `dev` through the personal SSH alias; do not publish to `main` unless requested.
+Implement the authorized stage, run the appropriate checks on its exact candidate tree, and present the stage summary for user approval. After that approval, commit only the intended files on `dev` using an English message. Publish the commit to `dev` through the personal SSH alias. The user owns integration and publication to `main`; do not perform that handoff on their behalf.
 
 ```text
 git push git@github-personal:vladicem0/CheckStock.git dev:dev
@@ -104,7 +104,7 @@ python scripts/review/local_review.py review --stage inventory-services
 python scripts/review/local_review.py status --stage inventory-services
 ```
 
-The wrapper also supports `-Repo`, `-StateDir`, `-SshHost`, `-SshUser`, `-RemoteScript`, `-GitUrl`, and `-TimeoutSeconds`. Defaults target the locations above; the remote script default is `/home/dev/bin/review-stage.sh` and the timeout is 960 seconds. Configuration changes do not authorize a different repository or publication scope.
+The wrapper also supports `-ReopenApproved` for the explicit correction workflow below, `-Repo`, `-StateDir`, `-SshHost`, `-SshUser`, `-RemoteScript`, `-GitUrl`, and `-TimeoutSeconds`. Defaults target the locations above; the remote script default is `/home/dev/bin/review-stage.sh` and the timeout is 960 seconds. Configuration changes do not authorize a different repository or publication scope. The wrapper is checked with PowerShell 7. With Windows PowerShell 5.1, pass `-Repo` explicitly: that version can fail while evaluating the existing default repository parameter, before the controller starts.
 
 ## Exact revision checks
 
@@ -129,7 +129,17 @@ The local validator accepts only a valid structured result for the requested sta
 | `CHANGES_REQUESTED` | 2 | Inspect findings, apply scoped fixes, verify, commit, publish, and review again |
 | `BLOCKED` | 3 | Stop and report the concrete blocker and available evidence |
 
-There is one initial review, iteration 0, and at most three fix reviews, iterations 1-3. Every fix review uses the original `BASE_SHA`, so it assesses the full stage and whether earlier findings are resolved. Fix attempts follow `CHANGES_REQUESTED` and a changed committed head.
+There is one initial review, iteration 0, and at most three fix reviews, iterations 1-3. Every fix review uses the original `BASE_SHA`, so it assesses the full stage and whether earlier findings are resolved. Normally, fix attempts follow `CHANGES_REQUESTED` and a changed committed head.
+
+If the user explicitly requests further corrections within an already approved stage, publish the authorized corrections and run:
+
+```text
+python scripts/review/local_review.py review --stage <existing-stage> --reopen-approved
+```
+
+The PowerShell equivalent is `./scripts/Review-Stage.ps1 -Action Review -Stage <existing-stage> -ReopenApproved`. This opt-in requires a previous `APPROVED` result and a changed published head. It consumes the next correction round under the same limit; it never resets the base, iteration count, or prior logs. Local run metadata records the explicit reopening request. Without the flag, an approved stage still rejects a new head. The flag is invalid for `start` or `status`, an unchanged approved head, and a stage without a prior approval.
+
+After a blocked transport attempt has reserved the reopened head and round, retry that same head without the flag; the retry does not consume another round. A later `CHANGES_REQUESTED` result follows the normal correction workflow. Unrelated work belongs to a new stage after its separate user handoff and approval.
 
 If iteration 3 still requests changes, stop and report the remaining findings. Never alter the base, delete state, or use a new slug to bypass the review limit. If a prerequisite fails, resolve the underlying issue deliberately; do not report the stage as approved or complete. A later commit invalidates approval, and `status` rejects a stale approval when the local or published head moves.
 

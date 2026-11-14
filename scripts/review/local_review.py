@@ -176,15 +176,23 @@ def load_state(path, repo, stage, git_url):
     return state
 
 
-def next_iteration(state, head):
+def next_iteration(state, head, *, reopen_approved=False):
     """An initial review plus three code-correction rounds; retries cost no round."""
     previous = state.get("last_reviewed_head")
     iteration = state["iteration"]
+    if reopen_approved:
+        if not previous or state.get("last_review_status") != "APPROVED":
+            raise ReviewError("--reopen-approved requires a prior APPROVED review.")
+        if head == previous:
+            raise ReviewError("--reopen-approved requires a changed head after approval.")
+        if iteration >= MAX_CORRECTIONS:
+            raise ReviewError("Three correction/re-review rounds are exhausted; report both positions to the user.")
+        return iteration + 1
     if previous == head and state.get("last_review_status") == "CHANGES_REQUESTED":
         raise ReviewError("The requested commit already needs changes; commit a correction before re-review.")
     if previous and head != previous:
         if state.get("last_review_status") == "APPROVED":
-            raise ReviewError("This stage was approved for a different commit; start a new stage.")
+            raise ReviewError("This stage was approved for a different commit; use --reopen-approved only for explicitly authorized corrections, or start a new stage.")
         if state.get("last_review_status") == "CHANGES_REQUESTED":
             if iteration >= MAX_CORRECTIONS:
                 raise ReviewError("Three correction/re-review rounds are exhausted; report both positions to the user.")
@@ -226,7 +234,7 @@ def parse_remote_result(completed, base, head, stage, iteration):
     return result
 
 
-def persist_run(directory, state, result, *, started, duration, stdout="", stderr="", error=None):
+def persist_run(directory, state, result, *, started, duration, stdout="", stderr="", error=None, reopen_approved=False):
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
     run_dir = directory / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -247,6 +255,7 @@ def persist_run(directory, state, result, *, started, duration, stdout="", stder
         "iteration": state["iteration"],
         "status": result["status"],
         "finding_counts": counts,
+        "reopen_approved": reopen_approved,
         "error": error,
     }
     atomic_json(run_dir / "metadata.json", metadata)
@@ -294,7 +303,11 @@ def review_stage(args, directory):
         if checked_head(args.repo, args.git_url) != head:
             raise ReviewError("Local HEAD changed while preparing review.")
         check_range(args.repo, base, head)
-        iteration = next_iteration(state, head)
+        iteration = next_iteration(state, head, reopen_approved=getattr(args, "reopen_approved", False))
+        if getattr(args, "reopen_approved", False):
+            previous = state["last_reviewed_head"]
+            if git(args.repo, "merge-base", "--is-ancestor", previous, head, check=False).returncode:
+                raise ReviewError("The reopened head must descend from the previously approved commit.")
         state["iteration"] = iteration
         # Reserve this head/round before dispatch, including a process failure.
         # A BLOCKED retry therefore cannot charge the same correction twice.
@@ -312,7 +325,9 @@ def review_stage(args, directory):
     except (ReviewError, OSError, ValueError) as exc:
         error = str(exc)
         result = make_blocked(base, head, error)
-    persist_run(directory, state, result, started=started, duration=time.monotonic() - clock, stdout=stdout, stderr=stderr, error=error)
+    persist_run(directory, state, result, started=started, duration=time.monotonic() - clock,
+                stdout=stdout, stderr=stderr, error=error,
+                reopen_approved=getattr(args, "reopen_approved", False))
     return result, EXIT_CODES[result["status"]]
 
 
@@ -349,7 +364,11 @@ def parse_arguments(argv=None):
     parser.add_argument("--ssh-user", default="dev")
     parser.add_argument("--remote-script", default="/home/dev/bin/review-stage.sh")
     parser.add_argument("--timeout", type=int, default=960)
+    parser.add_argument("--reopen-approved", action="store_true",
+                        help="Review only: explicitly reopen an approved stage for authorized corrections.")
     args = parser.parse_args(argv)
+    if args.reopen_approved and args.action != "review":
+        parser.error("--reopen-approved is allowed only with the review action.")
     if not STAGE.fullmatch(args.stage) or args.stage in (".", ".."):
         parser.error("--stage must be a lowercase ASCII identifier (1-64 characters).")
     for field in ("ssh_host", "ssh_user"):
