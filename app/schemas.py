@@ -123,7 +123,9 @@ class ProductView(BaseModel):
 class OperationView(BaseModel):
     id: UUID
     kind: Literal["receipt", "transfer", "fbs", "fbo"]
-    status: Literal["completed", "draft", "in_transit", "received", "reserved", "shipped", "cancelled"]
+    status: Literal[
+        "completed", "draft", "in_transit", "received", "reserved", "shipped", "delivered", "cancelled"
+    ]
     product_id: UUID
     sku: str
     product_name: str

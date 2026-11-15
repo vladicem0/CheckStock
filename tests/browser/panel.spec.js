@@ -69,6 +69,7 @@ const transitions = [
   ['transfer', 'draft', 'Отправить', 'transfers', 'dispatch', 'in_transit', 'transfer_dispatched', 'В пути'],
   ['transfer', 'in_transit', 'Принять', 'transfers', 'receive', 'received', 'transfer_received', 'Принято'],
   ['fbs', 'reserved', 'Отправить', 'fbs', 'ship', 'shipped', 'fbs_shipped', 'В пути к клиенту'],
+  ['fbs', 'shipped', 'Подтвердить доставку', 'fbs', 'deliver', 'delivered', 'fbs_delivered', 'Доставлено'],
   ['fbs', 'reserved', 'Отменить', 'fbs', 'cancel', 'cancelled', 'fbs_cancelled', 'Отменено'],
   ['fbo', 'in_transit', 'Принять FBO', 'fbo', 'receive', 'received', 'fbo_received', 'Принято'],
 ];
@@ -84,6 +85,7 @@ for (const [kind, before, label, category, suffix, after, eventType, statusLabel
     };
     await openPanel(page);
     const row = page.locator(`[data-operation-id="${OP}"]`);
+    await expect(row.getByRole('button', {name: /^Подтвердить доставку ·/})).toHaveCount(kind === 'fbs' && before === 'shipped' ? 1 : 0);
     await row.getByRole('button', {name: new RegExp(`^${label} ·`)}).click();
     await expect(row.locator('.badge')).toHaveText(statusLabel);
     await expect(page.locator('#history-body tr')).toHaveCount(1);
@@ -91,7 +93,108 @@ for (const [kind, before, label, category, suffix, after, eventType, statusLabel
     expect(dashboard.requests.filter(request => request.method === 'POST')).toEqual([
       {method: 'POST', path: `/api/${category}/${OP}/${suffix}`, body: null},
     ]);
-    if (after !== 'in_transit') await expect(row.locator('button')).toHaveCount(0);
+    if (after === 'shipped') await expect(row.getByRole('button', {name: /^Подтвердить доставку ·/})).toBeVisible();
+    else if (after !== 'in_transit') await expect(row.locator('button')).toHaveCount(0);
+  });
+}
+
+function shippedFbsDashboard(dashboard) {
+  const shipment = operation({status: 'shipped'});
+  dashboard.data.operations = [shipment];
+  dashboard.data.inventory.transit.fbs = [shipment];
+  Object.assign(dashboard.data.inventory.totals, {on_hand: 21, available: 21, transit_fbs: 4});
+  const source = dashboard.data.inventory.balances.find(cell => cell.product_id === P101 && cell.warehouse_id === NORTH);
+  Object.assign(source, {on_hand: 6, available: 6});
+  dashboard.data.history = [historyEvent({event_type: 'fbs_shipped', operation_status: 'shipped'})];
+  return shipment;
+}
+
+function deliveredFbsDashboard(dashboard) {
+  dashboard.data.operations[0].status = 'delivered';
+  dashboard.data.inventory.transit.fbs = [];
+  dashboard.data.inventory.totals.transit_fbs = 0;
+  dashboard.data.history.unshift(historyEvent({
+    id: '00000000-0000-4000-8000-000000000402',
+    event_type: 'fbs_delivered', operation_status: 'delivered',
+  }));
+}
+
+test('FBS delivery clears only transit and preserves stock and prior history', async ({page, dashboard}) => {
+  shippedFbsDashboard(dashboard);
+  dashboard.data.inventory.warehouses[0].archived = true;
+  dashboard.data.inventory.warehouses[0].archived_at = DATE;
+  for (const cell of dashboard.data.inventory.balances) {
+    if (cell.warehouse_id === NORTH) cell.archived = true;
+  }
+  dashboard.handle = async ({route, path, method}) => {
+    if (method !== 'POST' || path !== `/api/fbs/${OP}/deliver`) return false;
+    deliveredFbsDashboard(dashboard);
+    await route.fulfill({json: dashboard.data.operations[0]});
+    return true;
+  };
+  await openPanel(page);
+  const matrix = await page.locator('#stock-table').innerText();
+  const row = page.locator(`[data-operation-id="${OP}"]`);
+  await expect(page.locator('#total-transit-fbs')).toHaveText('4');
+  await expect(page.locator('#transit-fbs-list .transit-item')).toHaveCount(1);
+  await row.getByRole('button', {name: /^Подтвердить доставку ·/}).click();
+  await expect(row.locator('.badge')).toHaveText('Доставлено');
+  await expect(row.locator('button')).toHaveCount(0);
+  await expect(row.locator('.action-note')).toHaveText('Завершено');
+  await expect(page.locator('#operations-status')).toContainText('доставлено');
+  await expect(page.locator('#total-transit-fbs')).toHaveText('0');
+  await expect(page.locator('#transit-fbs-count')).toHaveText('0 шт.');
+  await expect(page.locator('#transit-fbs-list .transit-item')).toHaveCount(0);
+  await expect(page.locator('#transit-fbs-list')).toContainText('Сейчас нет товара в пути');
+  await expect(page.locator('#total-on-hand')).toHaveText('21');
+  await expect(page.locator('#total-reserved')).toHaveText('0');
+  await expect(page.locator('#total-available')).toHaveText('21');
+  expect(await page.locator('#stock-table').innerText()).toBe(matrix);
+  await expect(page.locator('#history-body tr')).toHaveCount(2);
+  await expect(page.locator('#history-body tr').first()).toContainText('FBS доставлен клиенту');
+  await expect(page.locator('#history-body tr').last()).toContainText('FBS отправлен клиенту');
+  await page.reload();
+  await expect(row.locator('.badge')).toHaveText('Доставлено');
+  await expect(row.locator('button')).toHaveCount(0);
+  expect(dashboard.requests.filter(request => request.method === 'POST')).toEqual([
+    {method: 'POST', path: `/api/fbs/${OP}/deliver`, body: null},
+  ]);
+});
+
+for (const failure of ['lost-response', 'http-503']) {
+  test(`FBS delivery ${failure} can replay the same operation without an automatic retry`, async ({page, dashboard}) => {
+    shippedFbsDashboard(dashboard);
+    let attempts = 0;
+    dashboard.handle = async ({route, path, method}) => {
+      if (method !== 'POST' || path !== `/api/fbs/${OP}/deliver`) return false;
+      attempts += 1;
+      if (attempts === 1) {
+        deliveredFbsDashboard(dashboard);
+        if (failure === 'lost-response') await route.abort('failed');
+        else await route.fulfill({status: 503, json: {detail: 'Не удалось получить результат'}});
+      } else {
+        await route.fulfill({json: dashboard.data.operations[0]});
+      }
+      return true;
+    };
+    await openPanel(page);
+    const row = page.locator(`[data-operation-id="${OP}"]`);
+    const confirm = row.getByRole('button', {name: /^Подтвердить доставку ·/});
+    await confirm.click();
+    await expect(page.locator('#operations-error')).toBeVisible();
+    await expect(page.locator('#operations-status')).toBeHidden();
+    await expect(confirm).toBeEnabled();
+    expect(attempts).toBe(1);
+    await confirm.click();
+    await expect(row.locator('.badge')).toHaveText('Доставлено');
+    await expect(page.locator('#operations-error')).toBeHidden();
+    await expect(page.locator('#total-transit-fbs')).toHaveText('0');
+    await expect(page.locator('#total-on-hand')).toHaveText('21');
+    await expect(page.locator('#history-body tr')).toHaveCount(2);
+    expect(dashboard.requests.filter(request => request.method === 'POST')).toEqual([
+      {method: 'POST', path: `/api/fbs/${OP}/deliver`, body: null},
+      {method: 'POST', path: `/api/fbs/${OP}/deliver`, body: null},
+    ]);
   });
 }
 
@@ -240,30 +343,35 @@ test('successful mutation followed by failed refresh is not submitted twice', as
   expect(dashboard.requests.filter(request => request.method === 'POST')).toHaveLength(1);
 });
 
-test('pending operation remains disabled when a manual refresh replaces its row', async ({page, dashboard}) => {
-  const started = deferred();
-  const release = deferred();
-  dashboard.data.operations = [operation()];
-  dashboard.handle = async ({route, method, path}) => {
-    if (method !== 'POST' || path !== `/api/fbs/${OP}/ship`) return false;
-    started.resolve();
-    await release.promise;
-    dashboard.data.operations[0].status = 'shipped';
-    await route.fulfill({json: dashboard.data.operations[0]});
-    return true;
-  };
-  await openPanel(page);
-  const row = page.locator(`[data-operation-id="${OP}"]`);
-  await row.getByRole('button', {name: /^Отправить ·/}).click();
-  await started.promise;
-  await page.locator('#refresh-button').click();
-  await expect(page.locator('#refresh-button')).toBeEnabled();
-  await expect(row.getByRole('button', {name: /^Отправить ·/})).toBeDisabled();
-  await expect(row.getByRole('button', {name: /^Отменить ·/})).toBeDisabled();
-  release.resolve();
-  await expect(row.locator('.badge')).toHaveText('В пути к клиенту');
-  expect(dashboard.requests.filter(request => request.method === 'POST')).toHaveLength(1);
-});
+for (const [before, suffix, label, after, statusLabel] of [
+  ['reserved', 'ship', 'Отправить', 'shipped', 'В пути к клиенту'],
+  ['shipped', 'deliver', 'Подтвердить доставку', 'delivered', 'Доставлено'],
+]) {
+  test(`pending FBS ${suffix} stays disabled when a manual refresh replaces its row`, async ({page, dashboard}) => {
+    const started = deferred();
+    const release = deferred();
+    dashboard.data.operations = [operation({status: before})];
+    dashboard.handle = async ({route, method, path}) => {
+      if (method !== 'POST' || path !== `/api/fbs/${OP}/${suffix}`) return false;
+      started.resolve();
+      await release.promise;
+      dashboard.data.operations[0].status = after;
+      await route.fulfill({json: dashboard.data.operations[0]});
+      return true;
+    };
+    await openPanel(page);
+    const row = page.locator(`[data-operation-id="${OP}"]`);
+    await row.getByRole('button', {name: new RegExp(`^${label} ·`)}).click();
+    await started.promise;
+    await page.locator('#refresh-button').click();
+    await expect(page.locator('#refresh-button')).toBeEnabled();
+    await expect(row.getByRole('button', {name: new RegExp(`^${label} ·`)})).toBeDisabled();
+    if (before === 'reserved') await expect(row.getByRole('button', {name: /^Отменить ·/})).toBeDisabled();
+    release.resolve();
+    await expect(row.locator('.badge')).toHaveText(statusLabel);
+    expect(dashboard.requests.filter(request => request.method === 'POST')).toHaveLength(1);
+  });
+}
 
 test('older failed refresh cannot replace a newer successful mutation refresh', async ({page, dashboard}) => {
   let holdNext = false;

@@ -70,6 +70,10 @@ def test_database_rejects_nonpositive_operation_quantity(db, qty):
      "destination_warehouse_id": None, "external_party": "Клиент"},
     {"kind": "fbo", "status": "reserved", "source_warehouse_id": demo_id("north"),
      "destination_warehouse_id": None, "external_party": "Маркетплейс"},
+    {"status": "delivered"},
+    {"kind": "transfer", "status": "delivered", "source_warehouse_id": demo_id("south")},
+    {"kind": "fbo", "status": "delivered", "source_warehouse_id": demo_id("north"),
+     "destination_warehouse_id": None, "external_party": "Маркетплейс"},
 ])
 def test_database_rejects_kind_status_mismatch(db, changes):
     with pytest.raises(IntegrityError) as caught:
@@ -206,7 +210,7 @@ def test_catalog_and_balance_database_uniqueness(db, entity):
 @pytest.mark.parametrize("kind,status", [
     ("receipt", "completed"),
     ("transfer", "draft"), ("transfer", "in_transit"), ("transfer", "received"),
-    ("fbs", "reserved"), ("fbs", "shipped"), ("fbs", "cancelled"),
+    ("fbs", "reserved"), ("fbs", "shipped"), ("fbs", "delivered"), ("fbs", "cancelled"),
     ("fbo", "in_transit"), ("fbo", "received"),
 ])
 def test_schema_accepts_each_documented_operation_state(db, kind, status):

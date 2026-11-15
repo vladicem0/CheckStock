@@ -65,7 +65,7 @@ class Operation(Base):
         CheckConstraint(
             "(kind = 'receipt' AND status = 'completed') OR "
             "(kind = 'transfer' AND status IN ('draft','in_transit','received')) OR "
-            "(kind = 'fbs' AND status IN ('reserved','shipped','cancelled')) OR "
+            "(kind = 'fbs' AND status IN ('reserved','shipped','delivered','cancelled')) OR "
             "(kind = 'fbo' AND status IN ('in_transit','received'))",
             name="ck_operation_status",
         ),

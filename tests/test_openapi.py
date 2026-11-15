@@ -25,6 +25,7 @@ REQUIRED_ROUTES = {
     "/api/transfers/{operation_id}/receive": {"post"},
     "/api/fbs/reservations": {"post"},
     "/api/fbs/{operation_id}/ship": {"post"},
+    "/api/fbs/{operation_id}/deliver": {"post"},
     "/api/fbs/{operation_id}/cancel": {"post"},
     "/api/fbo/shipments": {"post"},
     "/api/fbo/{operation_id}/receive": {"post"},
@@ -66,6 +67,7 @@ def test_openapi_exposes_request_constraints_and_concrete_response_models(docs_c
         assert request["properties"]["idempotency_key"]["maxLength"] == 200
     assert schemas["WarehouseInput"]["additionalProperties"] is False
     assert {"InventoryView", "OperationView", "StockEventView", "WarehouseView"} <= set(schemas)
+    assert "delivered" in schemas["OperationView"]["properties"]["status"]["enum"]
 
 
 class AssetReferences(HTMLParser):

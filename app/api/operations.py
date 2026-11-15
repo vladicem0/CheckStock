@@ -113,6 +113,19 @@ def cancel_fbs(operation_id: UUID, session: SessionDep) -> dict[str, Any]:
 
 
 @router.post(
+    "/fbs/{operation_id}/deliver",
+    response_model=OperationView,
+    summary="Подтвердить доставку FBS клиенту",
+    description=(
+        "Завершает транзит отправленного FBS и записывает доставку в историю. "
+        "Остатки и резервы ФФ не меняются. Повтор безопасен и не создаёт нового события."
+    ),
+)
+def deliver_fbs(operation_id: UUID, session: SessionDep) -> dict[str, Any]:
+    return _execute(session, operations.deliver_fbs, operation_id)
+
+
+@router.post(
     "/fbo/shipments",
     response_model=OperationView,
     summary="Отправить FBO маркетплейсу",
